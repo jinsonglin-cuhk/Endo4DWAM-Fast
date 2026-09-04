@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -451,7 +451,19 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        capture_layers: Optional[Sequence[int]] = None,
+        capture_out: Optional[Dict[int, torch.Tensor]] = None,
     ):
+        """`capture_layers` records the video expert's hidden state after those layer
+        indices into the caller-owned `capture_out` dict (used by the training-only
+        geometry branch). Leaving it None adds no tensor, no op and no RNG draw, so
+        the inference paths are structurally unchanged rather than conditionally so.
+
+        The captured tensor is the output of a non-reentrant checkpoint region, so a
+        second consumer is safe: autograd accumulates from both and recomputes once.
+        Never stash these on `self` -- under DeepSpeed that would pin the graph across
+        steps.
+        """
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
             raise ValueError(f"Missing expert tokens for {missing}")
@@ -466,6 +478,10 @@ class MoT(nn.Module):
             raise ValueError(f"`attention_mask` must be 2D [S, S], got shape {tuple(attention_mask.shape)}")
         if attention_mask.shape[0] != attention_mask.shape[1]:
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
+
+        capture_set = frozenset(int(i) for i in capture_layers) if capture_layers else frozenset()
+        if capture_set and capture_out is None:
+            raise ValueError("`capture_out` dict is required when `capture_layers` is set.")
 
         tokens_all = {k: v for k, v in embeds_all.items()}
 
@@ -551,6 +567,8 @@ class MoT(nn.Module):
                 )
 
                 tokens_all[name] = updated_tokens
+                if name == "video" and layer_idx in capture_set:
+                    capture_out[layer_idx] = updated_tokens
                 start = end
 
         return tokens_all

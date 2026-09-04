@@ -197,6 +197,58 @@ pseudo-action alignment（含梯度门 γ_p）→ real embodiment alignment。
 
 ---
 
+## 11. P0 补完 + history 帧数参数化（当日晚）
+
+### 11.1 pixel ↔ latent 映射（实测，推翻原假设）
+
+扰动单个像素帧再重编码 VAE，17 帧 256×320：
+
+```
+lat0 ← pix0(仅此一帧)  lat1 ← pix1-4  lat2 ← pix5-8  lat3 ← pix9-12  lat4 ← pix13-16
+```
+
+严格因果但**感受野向前泄漏 2–4 步**（pix0 仍影响 lat0..lat3）；**组内 argmax 是第一帧而非最后一帧**
+（lat1: pix1=0.850 vs pix4=0.756）⇒ 监督时刻应取 **pix 1/5/9/13**，方案原写的 4/8/12/16 是错的。
+K 个 clean latent 帧 = 前 4(K−1)+1 个像素帧；**K=2 ⇒ future 监督步 4 降到 3**。
+
+### 11.2 history 帧数参数化（解掉「不动 attention mask」的矛盾）
+
+**问题**：`wan_video_dit.py` 的 `first_frame_causal` 把 history 硬编码成只有第一帧。
+
+**改动**：`WanVideoDiT` 新增 `num_history_latent_frames`（默认 1），mask 泛化为 K 帧 history 块
+（别名 `first_k_frames_causal`）；[endo4dwam.py](../src/endo4dwam/models/wan22/endo4dwam.py) 的
+action→history mask、`build_inputs` 切片、`training_loss` 丢弃步数，以及
+[endo4dwam_idm.py](../src/endo4dwam/models/wan22/endo4dwam_idm.py) 两条分支同步参数化。
+`_compute_video_loss_per_sample` 的 `include_initial_video_step: bool` 改为
+`num_dropped_latent_steps: int`（bool 表达不了 K>1）。
+**推理仍只支持单帧 history，K>1 时四条 infer 路径显式报错**，不让训练/推理不一致被静默引入。
+
+**验证**：K=1 掩码与旧实现**逐位一致**；K=2 结构正确；pad 折叠重构在 200 组随机输入上与旧逻辑等价；
+键通过 `video_dit_config` 的签名校验；5 个 task config 仍全部 compose。
+
+### 11.3 几何头改用 MONO 的 `DPT`
+
+教师换 MONO 后头应同源。MONO 用 **`DPT`**（`DualDPT` 是 GIANT-1.1 anyview 分支的）。
+
+| 项 | 结果 |
+|---|---|
+| 参数量 | **29.8M**（DualDPT 约 47M/头） |
+| 权重加载 | **missing=0 / unexpected=0**，抽样键与文件逐位一致 |
+| `dim_in` | **1024**，正好等于选定的 `geo_dim` |
+| `patch_size=32` | 正好产出 256×320，对齐 register 网格 8×10 |
+| 显存(fwd+bwd, bf16) | batch4×3步 **1.086 GiB**；batch4×4步 1.481 GiB |
+
+### 11.4 光流：两个影响设计的发现
+
+- **69% 的帧几乎静止**（p50 幅度 0.00083，p99 0.0589）。运动监督目标绝大多数是零，
+  模型预测全零即可低 loss ⇒ λ_flow 与运动加权采样需据此设计。
+- **方向/步长约定判不明确**：高运动帧上做光度 warp，`t→t+1` 在 4/6 情形最优（+7~28%），
+  `t→t+2` 在 2/6（+1~3%），而 `flow_meta` 写 `stride: 2`。**须生成侧确认**，dataloader 依赖它。
+- **纠正方案中的一处错误**：StereoMIS 的 RAFT 不是内镜微调版，只是官方仓库副本 + 标准
+  `raft-things.pth`。在用的 `C_T_SKHT_V2` 训练更充分，无可换项。
+
+---
+
 ## 设计决策与遗留（2026-09-04）
 
 **已定**
@@ -208,16 +260,14 @@ pseudo-action alignment（含梯度门 γ_p）→ real embodiment alignment。
 - geo_dim 1024；深度对齐 `clamp s>0` + `stopgrad(s*,b*)`；flow 存 fp16 无损。
 
 **遗留 / 待办**
-- **P0 未完**：RAFT 两版内镜对比；DualDPT head 加载 + 训练侧显存实测；
-  **pixel frame ↔ latent timestep 真实映射**（Wan VAE 有 causal temporal conv 与 first-frame 特殊处理，
-  不能只按 stride=4 推断，该映射决定 register 的时间坐标与监督时刻数）。
+- ~~**P0 未完**~~ —— **已全部完成**，见第 11 节。
+- **flow 的方向/步长约定未定**（第 11.4 节），须生成侧确认。
 - **几何对齐未定死**：已产出深度是方形 `224×224`，源 360×480（0.750）、训练管线 256×320（0.800）。
   用相关性区分「整幅压扁」与「中心裁剪」得 0.6444 vs 0.6423，**差异太小判不了**，
   须由生成侧把确切变换写进 `depth_meta`。
-- **history ≥2 帧会推翻「不动 attention mask」的承诺**：`wan_video_dit.py:501-505` 的
-  `first_frame_causal` 把 history 硬编码成只有第一帧，需泛化为 `first_k_frames_causal`，
-  且 `_build_mot_attention_mask` 与 `latents[:,:,0:1]=first_frame_latents` 要同步改。
-  代价：latent 共 5 帧，2 帧 history ⇒ future 监督时刻从 4 降到 3。
+- ~~history ≥2 帧推翻「不动 attention mask」~~ —— **已实现并验证**（第 11.2 节）。
+  代价确认：K=2 ⇒ future 监督时刻从 4 降到 3。**推理路径尚未支持 K>1**（目前显式报错），
+  真要用 K=2 训练，得先把 infer 改成接受 K 帧 history。
 - **光流头没有预训练先验**：论文 Table 8 显示随机初始化的几何头比不加还差。λ_flow 需从小值起步并单独消融。
 - **算力**：全量 979,564 帧；A6000 8 张当前全部满载，每卡仅剩 16–19GB。
 - 训练前必做：`precompute_text_embeds.py`（`./data/text_embeds_cache/endowam` 目前为空；

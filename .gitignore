@@ -235,8 +235,8 @@ manifest.json
 *.no_exist*
 *models--t5*
 
-!data/fastwam_model_hf_release/libero_uncond_2cam224.pt
-!data/fastwam_model_hf_release/robotwin_uncond_3cam_384.pt
+!data/endo4dwam_model_hf_release/libero_uncond_2cam224.pt
+!data/endo4dwam_model_hf_release/robotwin_uncond_3cam_384.pt
 
 # OneLogger
 wandb/

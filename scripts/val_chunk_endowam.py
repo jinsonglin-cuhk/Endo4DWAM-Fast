@@ -34,7 +34,7 @@ Endo4DWAM checkpoint，对某个 LeRobot episode 做开环（GT state / 真实�
     conda activate fastwam   （机器上现有的 env，上游 FastWAM 时期建的）
     cd /mnt/data2/ljs/Endo4DWAM/Endo4DWAM-Fast
     python scripts/val_chunk_endowam.py \
-        --ckpt runs/endowam_uncond_lora/fastwam_uncond_lora_endowam_rot45/checkpoints/weights/step_080000.pt \
+        --ckpt runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60/checkpoints/weights/step_080000.pt \
         --task endowam_uncond_1cam_1e-4 \
         --dataset_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/esophagus \
         --episode 144 --execution_horizon 8 --max_windows 4000 --num_video_saves 0 --gpu 0
@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "--ckpt", type=str,
-        default="runs/endowam_uncond_lora/fastwam_uncond_lora_endowam_rot45/checkpoints/weights/step_080000.pt",
+        default="runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60/checkpoints/weights/step_080000.pt",
         help="model.save_checkpoint() 保存的 .pt 权重文件",
     )
     p.add_argument("--task", type=str, default="endowam_uncond_1cam_1e-4",

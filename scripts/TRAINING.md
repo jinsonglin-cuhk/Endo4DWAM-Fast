@@ -4,6 +4,18 @@
 
 > **工作目录**：以下所有命令均在仓库根目录 `/mnt/data2/ljs/Endo4DWAM/Endo4DWAM-Fast` 下执行。
 
+> **环境**：用 `fastwam` conda env（`hydra` / `torch` / `accelerate` 都在里面）。
+> 注意两个坑：
+> 1. 该 env 里的 editable 安装仍指向**旧仓库** `/mnt/data2/ljs/FastWAM/src/fastwam`，
+>    本仓库的包 `endo4dwam` **没有装**。直接跑脚本会 `ModuleNotFoundError: endo4dwam`，
+>    而 `import fastwam` 会静默用到旧仓库的代码。二选一：
+>    ```bash
+>    /home/user/miniconda3/envs/fastwam/bin/pip install -e .   # 装 endo4dwam（推荐）
+>    # 或每次显式指定：
+>    PYTHONPATH=src /home/user/miniconda3/envs/fastwam/bin/python scripts/...
+>    ```
+> 2. 别用 `openpi` 等其它 venv —— 它们没有 `hydra`。
+
 ---
 
 ## 目录
@@ -151,7 +163,7 @@ EVAL_EVERY=500               # = EndoWAM eval_interval
 
 # 输出目录（固定，方便 resume 时自动定位）
 RUN_ROOT=./runs/endowam_uncond_lora
-RUN_ID=fastwam_uncond_lora_endowam_z60_rot45
+RUN_ID=endo4dwam_uncond_lora_z60
 ```
 
 修改上述变量即可调整训练配置，无需改动 YAML。
@@ -198,7 +210,7 @@ bash scripts/train_zero2.sh 2 task=endowam_uncond_1cam_1e-4
 ## 7. 训练输出结构
 
 ```
-runs/endowam_uncond_lora/fastwam_uncond_lora_endowam_z60_rot45/
+runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60/
 ├── config.yaml                   # 训练时完整配置快照
 ├── dataset_stats.json            # 首次训练自动生成的 action/state 归一化统计
 ├── train_endowam_lora_uncond.sh  # 启动脚本副本（复现用）

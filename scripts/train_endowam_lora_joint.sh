@@ -24,12 +24,12 @@ NPROC_PER_NODE=2
 
 # ============================================================================
 # Run identity  (fixed so that --resume can locate the checkpoint dir)
-# NOTE: RUN_ID keeps its historical `fastwam_` prefix on purpose — existing
-# checkpoints live under runs/*/fastwam_*_endowam_rot45/, and renaming it here
-# would silently start a fresh run instead of resuming them.
+# NOTE: renamed from the historical fastwam_*_endowam_rot45 ids. The dataset
+# changed to endowam_pseudo_z60 (3 roots, no rot augmentation), so the old
+# checkpoints are not resumable against this data anyway.
 # ============================================================================
 RUN_ROOT=./runs/endowam_joint_lora
-RUN_ID=fastwam_joint_lora_endowam_rot45
+RUN_ID=endo4dwam_joint_lora_z60
 
 # ============================================================================
 # LoRA configuration  (matches EndoWAM defaults)

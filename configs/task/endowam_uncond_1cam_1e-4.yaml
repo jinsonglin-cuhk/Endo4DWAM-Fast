@@ -7,7 +7,7 @@
 # Workflow (run in order):
 #   1. One-time: generate per-episode stats so the LeRobot loader accepts v2.1:
 #        python scripts/build_endowam_episodes_stats.py \
-#          --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
+#          --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60
 #
 #   2. Precompute the T5 text-embedding cache for this task's prompts:
 #        python scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4

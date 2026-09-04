@@ -73,10 +73,10 @@ Endo4DWAM 的 LeRobot 数据加载器需要每个子集下存在 `meta/episodes_
 # ✅ EndoWAM z60_rot45 数据集已预先生成，无需重新执行
 # 若换了新数据集或文件缺失，才需要运行：
 python scripts/build_endowam_episodes_stats.py \
-    --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
+    --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60
 ```
 
-**当前状态**：`endowam_pseudo_z60_rot45` 下全部 24 个子集（3 procedures × 8 rot）的 `episodes_stats.jsonl` 均已存在。
+**当前状态**：⚠️ `endowam_pseudo_z60` 下 **3 个 root（ercp / esophagus / ureter）的 `episodes_stats.jsonl` 全部缺失**，训练前必须先运行上面的命令。
 
 ### 3.2 预计算 T5 文本 Embedding 缓存
 
@@ -266,7 +266,7 @@ Wan2.2 使用 `WanVideoVAE38`，空间压缩 **16×**（内部先 patchify 2×�
 | 288×384 | 9 | 12 | ✅ |
 | 224×288 | 7 | 9 | ✅ |
 
-EndoWAM 数据集当前使用 `[256, 320]`（从原始 270×360 下采样，近似 4:3）。
+EndoWAM 数据集当前使用 `[256, 320]`（原始 360×480，等比缩放后中心裁剪，裁掉约 21px 宽）。
 | ZeRO-2（参数 shard 到多卡） | 线性降低 |
 
 > task config 里默认 `model.mot_checkpoint_mixed_attn: false`，若 OOM 改为 `true`。

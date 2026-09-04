@@ -3,7 +3,7 @@
 #
 # Model  : Endo4DWAMJoint (action attends full video sequence)
 # LoRA   : injected on WanVideoDiT video expert (analogous to EndoWAM Cosmos LoRA)
-# Data   : endowam_pseudo_z60_rot45  (3 procedures × 8 rot angles = 24 LeRobot roots)
+# Data   : endowam_pseudo_z60  (3 procedures = 3 LeRobot roots)
 #
 # Usage:
 #   Fresh start:   bash scripts/train_endowam_lora_joint.sh
@@ -11,7 +11,7 @@
 #
 # Pre-requisites (one-time, before first run):
 #   1. python scripts/build_endowam_episodes_stats.py \
-#          --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
+#          --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60
 #   2. python scripts/precompute_text_embeds.py task=endowam_joint_1cam_1e-4
 
 set -euo pipefail

@@ -24,16 +24,17 @@ The EndoWAM dataset is laid out as:
         meta/{info.json, episodes.jsonl, ...}
         data/chunk-000/episode_xxxxxx.parquet
 
-This script walks every <procedure>/rot### directory that has a meta/info.json
-and processes it.
+This script handles both layouts: a flat <procedure>/ that itself holds
+meta/info.json (endowam_pseudo_z60), and <procedure>/rot### subdirectories
+(the rot-augmented variants).
 
 Run (use an env with pyarrow, e.g. the `fastwam` env created for the upstream repo):
     /home/user/miniconda3/envs/fastwam/bin/python scripts/build_endowam_episodes_stats.py \
-        --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
+        --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60
 
     # restrict to some procedures / angles, or overwrite existing files:
     /home/user/miniconda3/envs/fastwam/bin/python scripts/build_endowam_episodes_stats.py \
-        --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45 \
+        --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60 \
         --procedures ureter --angles rot000,rot045 --overwrite
 """
 import argparse
@@ -109,7 +110,7 @@ def process_rot_dir(rot_dir: Path, overwrite: bool) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root",
-                    default="/mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45")
+                    default="/mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60")
     ap.add_argument("--procedures", default="",
                     help="comma list to restrict procedures, e.g. 'ureter'; empty = all")
     ap.add_argument("--angles", default="",
@@ -130,17 +131,34 @@ def main():
         return
 
     total = 0
+    n_roots = 0
     for proc in procedures:
+        # Two layouts are supported:
+        #   flat     <data_root>/<procedure>/meta/info.json          (endowam_pseudo_z60)
+        #   angled   <data_root>/<procedure>/rot###/meta/info.json   (…_rot45 variants)
+        if (proc / "meta" / "info.json").is_file():
+            if angle_filter:
+                print(f"[{proc.name}] flat layout, ignoring --angles")
+            print(f"[{proc.name}] flat layout")
+            total += process_rot_dir(proc, args.overwrite)
+            n_roots += 1
+            continue
+
         rot_dirs = sorted(d for d in proc.iterdir()
                           if d.is_dir() and d.name.startswith("rot")
                           and (not angle_filter or d.name in angle_filter))
         if not rot_dirs:
+            print(f"[{proc.name}] [WARN] neither meta/info.json nor rot### dirs; skipped")
             continue
         print(f"[{proc.name}] {len(rot_dirs)} angle dirs")
         for rot in rot_dirs:
             total += process_rot_dir(rot, args.overwrite)
+            n_roots += 1
 
-    print(f"\nDone. wrote episodes_stats.jsonl for {total} rot dirs under {data_root}")
+    if n_roots == 0:
+        print(f"\n[ERR] no LeRobot roots found under {data_root}")
+        return
+    print(f"\nDone. wrote episodes_stats.jsonl for {total}/{n_roots} roots under {data_root}")
 
 
 if __name__ == "__main__":

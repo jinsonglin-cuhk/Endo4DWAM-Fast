@@ -36,7 +36,7 @@ Endo4DWAM checkpoint，对某个 LeRobot episode 做开环（GT state / 真实�
     python scripts/val_chunk_endowam.py \
         --ckpt runs/endowam_uncond_lora/fastwam_uncond_lora_endowam_rot45/checkpoints/weights/step_080000.pt \
         --task endowam_uncond_1cam_1e-4 \
-        --dataset_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot045 \
+        --dataset_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/esophagus \
         --episode 144 --execution_horizon 8 --max_windows 4000 --num_video_saves 0 --gpu 0
 """
 
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_stats", type=str, default=None,
                     help="dataset_stats.json 路径；缺省从 ckpt 的上级 run 目录自动查找")
     p.add_argument("--dataset_root", type=str,
-                    default="/mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot000",
+                    default="/mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/ureter",
                     help="单个 LeRobot root（procedure/rotXXX），只在这一个 root 内选 episode")
     p.add_argument("--episode", type=int, default=0, help="root 内的 episode 序号（0-based）")
     p.add_argument("--execution_horizon", type=int, default=8,

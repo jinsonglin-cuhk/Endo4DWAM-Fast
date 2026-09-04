@@ -124,19 +124,19 @@ The training config loads this file via `model.action_dit_pretrained_path`.
 ## Dataset
 
 Training uses the EndoWAM endoscope **pseudo-action** dataset
-(`endowam_pseudo_z60_rot45`), laid out as LeRobot v2.1 roots:
+(`endowam_pseudo_z60`), laid out as LeRobot v2.1 roots:
 
 ```text
-endowam_pseudo_z60_rot45/
-├── ercp/{rot000,rot045,...,rot315}/        # 3 procedures x 8 rotation angles
-├── esophagus/{rot000,...,rot315}/          #   = 24 LeRobot-v2.1 roots,
-└── ureter/{rot000,...,rot315}/             #     merged via MultiLeRobotDataset
+endowam_pseudo_z60/
+├── ercp/          201 episodes / 407,617 frames   # 3 procedures = 3 LeRobot-v2.1
+├── esophagus/     163 episodes / 165,335 frames   #   roots, merged via
+└── ureter/        151 episodes / 406,612 frames   #   MultiLeRobotDataset
 ```
 
 | Field | Value |
 |---|---|
 | Camera | single, `observation.images.endoscope` |
-| Video | 270x360 (HxW) raw, resized to 256x320 |
+| Video | 360x480 (HxW, aspect 0.750) raw, 30 fps; aspect-preserving resize then centre crop to 256x320 (~21px of width cropped, no distortion) |
 | Action | 3-DoF discrete pseudo-action (m2/m3/m4 target rpm), values in `{-1, 0, 1}` |
 | State | previous-step action, also 3-D |
 
@@ -157,7 +157,7 @@ The LeRobot loader requires per-episode stats on v2.1 roots:
 
 ```bash
 python scripts/build_endowam_episodes_stats.py \
-  --data_root /path/to/endowam_pseudo_z60_rot45
+  --data_root /path/to/endowam_pseudo_z60
 ```
 
 ### 2) Precompute the T5 text-embedding cache
@@ -240,7 +240,7 @@ and `state/` directories are deleted automatically.
 python scripts/val_chunk_endowam.py \
   --ckpt runs/endowam_uncond_lora/<run_id>/checkpoints/weights/step_080000.pt \
   --task endowam_uncond_1cam_1e-4 \
-  --dataset_root /path/to/endowam_pseudo_z60_rot45/esophagus/rot045 \
+  --dataset_root /path/to/endowam_pseudo_z60/esophagus/rot045 \
   --episode 144 --execution_horizon 8 --max_windows 4000 \
   --num_video_saves 0 --gpu 0
 ```
@@ -270,7 +270,8 @@ expert is fully fine-tuned:
 **Resolution constraint.** Wan2.2 uses `WanVideoVAE38`, whose spatial compression is **16x**
 (2x patchify, then an 8x encoder), and the DiT patchifies by another 2x. Video height and
 width must therefore both be divisible by **32**. The default 256x320 satisfies this while
-staying close to the native 270x360 aspect ratio, so no distortion is introduced.
+close to the native 360x480 aspect ratio (0.750 vs 0.800); the loader resizes
+preserving aspect and centre-crops, so no distortion is introduced.
 
 ## Acknowledgements
 

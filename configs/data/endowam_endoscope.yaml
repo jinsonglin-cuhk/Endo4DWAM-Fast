@@ -1,17 +1,22 @@
-# EndoWAM endoscope dataset (pseudo-action OBB, z60, rot45 augmented) for Endo4DWAM.
+# EndoWAM endoscope dataset (pseudo-action OBB, z60) for Endo4DWAM.
 #
 # Single camera (observation.images.endoscope), 3-DoF discrete pseudo-action
 # (m2/m3/m4 target rpm, values in {-1,0,1}, already in [-1,1]).
 # State == previous-step action, also 3-D.
 #
-# Layout: 3 procedures x 8 rotation angles = 24 LeRobot-v2.1 roots, merged via
-# MultiLeRobotDataset (dataset_dirs accepts a list).
+# Layout: 3 procedures = 3 LeRobot-v2.1 roots (NO rotation augmentation), merged
+# via MultiLeRobotDataset (dataset_dirs accepts a list).
+#   ercp       201 episodes / 407,617 frames
+#   ureter     151 episodes / 406,612 frames
+#   esophagus  163 episodes / 165,335 frames
+# Source video is 360x480 (HxW), 30 fps.
 #
 # IMPORTANT (do these before training):
 #   1. Generate meta/episodes_stats.jsonl for every root (Endo4DWAM's LeRobot
 #      loader requires it on v2.1; EndoWAM only ships stats_gr00t.json):
 #        python scripts/build_endowam_episodes_stats.py \
-#          --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
+#          --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60
+#      STATUS: currently MISSING for all three roots -- run this before training.
 #   2. Precompute T5 text-embedding cache (see task config).
 #
 # Notes on the careful bits (input/output + normalization):
@@ -22,41 +27,24 @@
 #     direction commands, NOT end-effector poses. They must NOT be differenced.
 #   - norm_default_mode: min/max — maps the already-[-1,1] action/state to
 #     [-1,1] (near-identity); avoids z-score blowing up the discrete values.
-#   - video 270x360 (HxW) -> [256, 320] (near 4:3, no distortion) and
-#     is divisible by 32 for the Wan2.2 VAE (16x, patchify 2x + encoder 8x) + DiT patch (2x).
+#   - video 360x480 (HxW, aspect 0.750) -> [256, 320] (aspect 0.800). The loader
+#     does an aspect-preserving resize then a centre crop, so there is NO
+#     distortion, but ~21px of width is cropped. 256x320 is divisible by 32 for
+#     the Wan2.2 VAE (16x, patchify 2x + encoder 8x) + DiT patch (2x).
+#     Exact-0.750 alternatives divisible by 32 are 192x256 (0.60x the tokens)
+#     and 288x384 (1.35x); 256x320 was kept deliberately.
 #     NOTE: WanVideoVAE38.upsampling_factor=16, NOT 8; video dims must be divisible by 32.
 
 train:
   _target_: endo4dwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot000
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot045
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot090
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot135
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot180
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot225
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot270
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot315
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot000
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot045
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot090
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot135
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot180
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot225
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot270
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/esophagus/rot315
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot000
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot045
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot090
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot135
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot180
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot225
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot270
-    - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ureter/rot315
+    - /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/ercp
+    - /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/esophagus
+    - /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/ureter
   shape_meta:
     images:
       - key: endoscope          # -> observation.images.endoscope
-        raw_shape: [3, 270, 360]
+        raw_shape: [3, 360, 480]
         shape: [3, 256, 320]
     action:
       - key: default            # -> action

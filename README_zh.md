@@ -120,19 +120,19 @@ python scripts/preprocess_action_dit_backbone.py \
 
 ## 数据集
 
-训练使用 EndoWAM 内镜**伪动作**数据集（`endowam_pseudo_z60_rot45`），按 LeRobot v2.1 组织：
+训练使用 EndoWAM 内镜**伪动作**数据集（`endowam_pseudo_z60`），按 LeRobot v2.1 组织：
 
 ```text
-endowam_pseudo_z60_rot45/
-├── ercp/{rot000,rot045,...,rot315}/        # 3 个术式 × 8 个旋转角
-├── esophagus/{rot000,...,rot315}/          #   = 24 个 LeRobot-v2.1 root，
-└── ureter/{rot000,...,rot315}/             #     通过 MultiLeRobotDataset 合并
+endowam_pseudo_z60/
+├── ercp/          201 episodes / 407,617 帧    # 3 个术式 = 3 个 LeRobot-v2.1
+├── esophagus/     163 episodes / 165,335 帧    #   root，通过
+└── ureter/        151 episodes / 406,612 帧    #   MultiLeRobotDataset 合并
 ```
 
 | 字段 | 取值 |
 |---|---|
 | 相机 | 单目，`observation.images.endoscope` |
-| 视频 | 原始 270×360（H×W），resize 到 256×320 |
+| 视频 | 原始 360×480（H×W，比例 0.750），30 fps；等比缩放后中心裁剪到 256×320（裁掉约 21px 宽，无形变） |
 | 动作 | 3 维离散伪动作（m2/m3/m4 目标转速），取值 `{-1, 0, 1}` |
 | 状态 | 上一步的动作，同样 3 维 |
 
@@ -153,7 +153,7 @@ LeRobot 加载器要求 v2.1 的每个 root 下有 per-episode 统计：
 
 ```bash
 python scripts/build_endowam_episodes_stats.py \
-  --data_root /path/to/endowam_pseudo_z60_rot45
+  --data_root /path/to/endowam_pseudo_z60
 ```
 
 ### 2）预计算 T5 文本 embedding 缓存
@@ -231,7 +231,7 @@ runs/<run_root>/<run_id>/
 python scripts/val_chunk_endowam.py \
   --ckpt runs/endowam_uncond_lora/<run_id>/checkpoints/weights/step_080000.pt \
   --task endowam_uncond_1cam_1e-4 \
-  --dataset_root /path/to/endowam_pseudo_z60_rot45/esophagus/rot045 \
+  --dataset_root /path/to/endowam_pseudo_z60/esophagus/rot045 \
   --episode 144 --execution_horizon 8 --max_windows 4000 \
   --num_video_saves 0 --gpu 0
 ```
@@ -258,7 +258,7 @@ python scripts/val_chunk_endowam.py \
 
 **分辨率约束。** Wan2.2 用的是 `WanVideoVAE38`，空间压缩为 **16×**（先 2× patchify，再 8× 编码器），
 DiT 还会再 patchify 2×。因此视频的高和宽都必须被 **32** 整除。默认的 256×320 满足该约束，
-同时接近原始 270×360 的宽高比，不引入形变。
+接近原始 360×480 的宽高比（0.750 vs 0.800）；加载器等比缩放后中心裁剪，不引入形变。
 
 ## 致谢
 

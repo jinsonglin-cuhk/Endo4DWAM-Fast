@@ -1,60 +1,94 @@
-# FastWAM
+# Endo4DWAM-Fast
 
-**Fast-WAM: Do World Action Models Need Test-time Future Imagination?** 的官方代码仓库。
+面向**内镜**的视频 + 动作世界模型 baseline，基于
+[FastWAM](https://github.com/yuantianyuan01/FastWAM)（Wan2.2-TI2V-5B 视频 DiT + ActionDiT，
+联合 flow matching 训练）改造，适配 EndoWAM 内镜数据集。
 
 [![English](https://img.shields.io/badge/README-English-111111.svg)](./README.md)
 [![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d14836.svg)](./README_zh.md)
 
-[![arXiv](https://img.shields.io/badge/arXiv-2603.16666-b31b1b.svg)](https://arxiv.org/abs/2603.16666)
-[![Project Page](https://img.shields.io/badge/Project_Page-Fast--WAM-2ea44f.svg)](https://yuantianyuan01.github.io/FastWAM/)
-[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-f7c843)](https://huggingface.co/yuanty/fastwam)
-[![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
-[![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
-
-本仓库包含 FastWAM 在 LIBERO / RoboTwin 上的训练与评估代码。
+更详细的分步训练说明见 [`scripts/TRAINING.md`](./scripts/TRAINING.md)。
 
 ## 目录
 
-- [File Structure](#file-structure)
+- [总览](#总览)
+- [目录结构](#目录结构)
 - [环境安装](#环境安装)
 - [模型准备](#模型准备)
-- [数据集下载](#数据集下载)
-- [使用 Release 权重推理](#使用-release-权重推理)
+- [数据集](#数据集)
+- [一次性预处理](#一次性预处理)
 - [训练](#训练)
-- [使用自己训练的权重推理](#使用自己训练的权重推理)
+- [训练输出](#训练输出)
+- [评估](#评估)
+- [关键设计说明](#关键设计说明)
 - [致谢](#致谢)
 - [BibTeX](#bibtex)
 
-## File Structure
+## 总览
+
+模型用两个共享 attention 的 expert（Mixture-of-Transformers，简称 MoT）同时对
+**视频 latent 流**和**动作流**做去噪：
+
+- **视频 expert** —— Wan2.2-TI2V-5B `WanVideoDiT`（30 层，hidden 3072）
+- **动作 expert** —— `ActionDiT`（30 层，hidden 1024），由 Wan2.2 DiT 逐层线性插值得到的
+  backbone 初始化
+
+共三个变体，通过 Hydra 的 `model` group 选择：
+
+| 变体 | 类名 | 模型配置 | 行为 |
+|---|---|---|---|
+| base（uncond） | `Endo4DWAM` | `configs/model/endo4dwam.yaml` | action token 只 attend **第一帧** video latent，推理时可缓存视频 K/V 加速 |
+| joint | `Endo4DWAMJoint` | `configs/model/endo4dwam_joint.yaml` | action token attend **完整** video 序列，更强但更慢的 baseline |
+| IDM | `Endo4DWAMIDM` | `configs/model/endo4dwam_idm.yaml` | 两阶段推理：先去噪视频，再以其为条件预测动作 |
+
+**推荐起点**：base 变体，对应 `scripts/train_endowam_lora_uncond.sh`。
+
+与上游 FastWAM 的差异：
+
+- 任务从 LIBERO / RoboTwin 机械臂操作换成**单目内镜视频** + 3 维离散伪动作。
+- 在视频 expert 上新增了 **LoRA** 路径（上游只做 DiT 全参数微调），参数与 EndoWAM 的
+  Cosmos LoRA 对齐（rank 16 / alpha 32 / dropout 0.05）。
+- 新增 `save_total_limit`，只保留最新 checkpoint。
+
+## 目录结构
 
 ```text
-FastWAM/
+Endo4DWAM-Fast/
 ├── configs/
-│   ├── data/                 # 数据集配置（LIBERO、RoboTwin 等）
-│   ├── model/                # 模型结构与组件配置
-│   └── task/                 # 任务级配置（训练 task 名）
+│   ├── train.yaml                        # 全局训练默认值
+│   ├── data/
+│   │   └── endowam_endoscope.yaml        # EndoWAM 内镜数据集配置
+│   ├── model/
+│   │   ├── endo4dwam.yaml                # base 模型配置（含 LoRA 默认值）
+│   │   ├── endo4dwam_joint.yaml
+│   │   └── endo4dwam_idm.yaml
+│   └── task/
+│       ├── endowam_uncond_1cam_1e-4.yaml # base 任务配置
+│       └── endowam_joint_1cam_1e-4.yaml  # joint 任务配置
 ├── scripts/
-│   ├── train.py
-│   ├── train_zero1.sh        # deepspeed zero1 训练入口
-│   ├── preprocess_action_dit_backbone.py  # 训练前预处理 ActionDiT backbone
-│   └── precompute_text_embeds.py  # 训练前预计算 T5 文本 embedding cache
-├── experiments/
-│   ├── libero/
-│   │   └── run_libero_manager.py
-│   └── robotwin/
-│       └── run_robotwin_manager.py
-├── src/fastwam/              # 核心代码
-├── runs/                     # 训练输出（ckpt、日志）
-├── checkpoints/              # 预训练或外部 checkpoint
-├── data/                     # data目录
-└── evaluate_results/         # 推理/评估结果
+│   ├── TRAINING.md                       # 详细训练文档
+│   ├── train_endowam_lora_uncond.sh      # base + LoRA 训练脚本
+│   ├── train_endowam_lora_joint.sh       # joint + LoRA 训练脚本
+│   ├── train_zero1.sh / train_zero2.sh   # 通用 DeepSpeed ZeRO-1 / ZeRO-2 启动脚本
+│   ├── train.py                          # Hydra 训练入口
+│   ├── build_endowam_episodes_stats.py   # 一次性：生成 meta/episodes_stats.jsonl
+│   ├── precompute_text_embeds.py         # 一次性：预计算 T5 文本 embedding 缓存
+│   ├── preprocess_action_dit_backbone.py # 一次性：生成 ActionDiT backbone
+│   └── val_chunk_endowam.py              # 离线 per-axis 动作精度 + 视频指标
+├── src/endo4dwam/                        # 核心代码
+├── runs/                                 # 训练输出（checkpoint、日志、eval 视频）
+├── checkpoints/                          # 预训练 / 外部权重
+└── data/                                 # 文本 embedding 缓存等本地数据
 ```
+
+`experiments/{libero,robotwin}/` 和 `third_party/RoboTwin/` 继承自上游 FastWAM，保留下来是为了
+上游 benchmark 仍可运行，但它们**不属于**内镜流程，本项目也未做验证。
 
 ## 环境安装
 
 ```bash
-conda create -n fastwam python=3.10 -y
-conda activate fastwam
+conda create -n endo4dwam python=3.10 -y
+conda activate endo4dwam
 pip install -U pip
 pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
@@ -62,241 +96,181 @@ pip install -e .
 
 ## 模型准备
 
-这一步同时是训练和推理的前置项。
-
-第一步，先设置 Wan 模型目录（可选，默认 `./checkpoints`）：
+训练前必做。第 1 步：把 Wan 模型缓存目录指到 `./checkpoints`（可选，这是默认值）：
 
 ```bash
 mkdir -p checkpoints
 export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
 ```
 
-第二步，预生成 ActionDiT backbone（从Wan22 DiT插值）：
+视频 DiT 基础模型（`Wan-AI/Wan2.2-TI2V-5B`）和 tokenizer（`Wan-AI/Wan2.1-T2V-1.3B`）会在
+首次使用时下载到该目录。
+
+第 2 步：预生成 ActionDiT backbone（由 Wan2.2 DiT 逐层插值得到）：
 
 ```bash
-# uncond (fastwam)
 python scripts/preprocess_action_dit_backbone.py \
-  --model-config configs/model/fastwam.yaml \
+  --model-config configs/model/endo4dwam.yaml \
   --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
   --device cuda \
   --dtype bfloat16
 ```
 
-## 数据集下载
+训练时通过 `model.action_dit_pretrained_path` 加载该文件。
 
-### LIBERO
+## 数据集
 
-Fast-WAM 使用的 LIBERO 预处理数据已发布到：
-
-- https://huggingface.co/datasets/yuanty/LIBERO-fastwam
-
-先下载全部压缩包，再全部解压：
-
-```bash
-mkdir -p data/libero_mujoco3.3.2
-cd data/libero_mujoco3.3.2
-
-# 下载 4 个 tar.gz 文件后执行
-for f in *.tar.gz; do
-  tar -xzf "$f"
-done
-```
-
-解压后目录结构应为：
+训练使用 EndoWAM 内镜**伪动作**数据集（`endowam_pseudo_z60_rot45`），按 LeRobot v2.1 组织：
 
 ```text
-data/libero_mujoco3.3.2/
-├── libero_10_no_noops_lerobot/
-├── libero_goal_no_noops_lerobot/
-├── libero_object_no_noops_lerobot/
-└── libero_spatial_no_noops_lerobot/
+endowam_pseudo_z60_rot45/
+├── ercp/{rot000,rot045,...,rot315}/        # 3 个术式 × 8 个旋转角
+├── esophagus/{rot000,...,rot315}/          #   = 24 个 LeRobot-v2.1 root，
+└── ureter/{rot000,...,rot315}/             #     通过 MultiLeRobotDataset 合并
 ```
 
-### RoboTwin
+| 字段 | 取值 |
+|---|---|
+| 相机 | 单目，`observation.images.endoscope` |
+| 视频 | 原始 270×360（H×W），resize 到 256×320 |
+| 动作 | 3 维离散伪动作（m2/m3/m4 目标转速），取值 `{-1, 0, 1}` |
+| 状态 | 上一步的动作，同样 3 维 |
 
-Fast-WAM 使用的 RoboTwin 预处理数据已发布到：
+动作是**离散方向指令**而非末端位姿，由此有两个必须注意的设置（`configs/data/endowam_endoscope.yaml`
+中已配好）：
 
-- https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam
+- `delta_action_dim_mask.default: [false, false, false]` —— 动作**不能**做差分。
+- `norm_default_mode: min/max` —— 把本来就在 `[-1, 1]` 的值映射为近似恒等，避免 z-score
+  把离散取值放大。
 
-先下载全部分卷文件，再拼接并解压：
+如果数据集路径不同，改该配置里的 `dataset_dirs` 即可。
+
+## 一次性预处理
+
+### 1）生成 `meta/episodes_stats.jsonl`
+
+LeRobot 加载器要求 v2.1 的每个 root 下有 per-episode 统计：
 
 ```bash
-mkdir -p data/robotwin2.0
-cd data/robotwin2.0
-
-# 下载全部 robotwin2.0.tar.gz.part-* 文件后执行
-cat robotwin2.0.tar.gz.part-* | tar -xzf -
+python scripts/build_endowam_episodes_stats.py \
+  --data_root /path/to/endowam_pseudo_z60_rot45
 ```
 
-解压后目录结构应为：
+### 2）预计算 T5 文本 embedding 缓存
 
-```text
-data/robotwin2.0/
-└── robotwin2.0/
-    ├── data/
-    ├── meta/
-    └── videos/
-```
-
-根目录下如果同时保留：
-
-```text
-data/robotwin2.0/dataset_stats.json
-```
-
-可直接作为本仓库当前配置使用的统计文件，也可重新计算。
-
-## 使用 Release 权重推理
-
-release 的模型权重以及对应的 dataset stats 已经发布到 [Hugging Face](https://huggingface.co/yuanty/fastwam).
-
-从 Hugging Face 下载 release 权重和 dataset stats：
+训练时文本编码器被冻结且不加载到 GPU，所以 prompt 的编码结果需要提前缓存到磁盘：
 
 ```bash
-pip install -U huggingface_hub
-
-huggingface-cli download yuanty/fastwam \
-  libero_uncond_2cam224.pt \
-  libero_uncond_2cam224_dataset_stats.json \
-  robotwin_uncond_3cam_384.pt \
-  robotwin_uncond_3cam_384_dataset_stats.json \
-  --local-dir ./checkpoints/fastwam_release
+python scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4
 ```
 
-下载后，本地目录应为：
-
-```text
-checkpoints/fastwam_release/
-├── libero_uncond_2cam224.pt
-├── libero_uncond_2cam224_dataset_stats.json
-├── robotwin_uncond_3cam_384.pt
-└── robotwin_uncond_3cam_384_dataset_stats.json
-```
-
-`LIBERO` benchmark 评测前，请先按 [LIBERO 官方仓库](https://github.com/Lifelong-Robot-Learning/LIBERO) 安装环境：
-最后一步执行：
+缓存写入 `./data/text_embeds_cache/endowam/`，**uncond 与 joint 共用同一份**，只需运行一次。
+多 GPU 加速：
 
 ```bash
-pip install mujoco==3.3.2
+torchrun --standalone --nproc_per_node=2 scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4
 ```
-
-`mujoco` 环境和 LIBERO 数据版本相关，最好保持一致。
-
-我们已经把 `RoboTwin` 评测相关代码copy到了 `third_party/RoboTwin`。
-但仍需按 [RoboTwin 官方仓库](https://github.com/RoboTwin-Platform/RoboTwin) 中的教程完成环境安装并下载相关assets：
-再创建 policy 软链接：
-
-```bash
-ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
-```
-
-一键评测 release 的 LIBERO 权重：
-
-当前 `LIBERO` / `RoboTwin` 的评测 manager 默认使用 `8` 张 GPU
-（`configs/sim_libero.yaml` 和 `configs/sim_robotwin.yaml` 中的
-`MULTIRUN.num_gpus=8`）。
-如果你想用更少的卡，直接在命令行里传更小的值，例如
-`MULTIRUN.num_gpus=4`。
-
-```bash
-python experiments/libero/run_libero_manager.py \
-  task=libero_uncond_2cam224_1e-4 \
-  ckpt=./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json \
-  MULTIRUN.num_gpus=8
-```
-
-一键评测 release 的 RoboTwin 权重：
-
-```bash
-python experiments/robotwin/run_robotwin_manager.py \
-  task=robotwin_uncond_3cam_384_1e-4 \
-  ckpt=./checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json \
-  MULTIRUN.num_gpus=8
-```
-
-为了加速 RoboTwin 评测，我们在 [`configs/sim_robotwin.yaml`](./configs/sim_robotwin.yaml) 中打开了 `EVALUATION.skip_get_obs_within_replan=true`。
-它会在一次 replan 窗口内连续执行一个 action chunk 时跳过 RGB 渲染，评测更快，但保存下来的视频帧率会低。
-如果想保存完整视频，可以把它设为 `false`。
-
-**注意：**我们测试用的是**unseen**指令，这点和Motus对齐。而[Lingbot-VA](https://github.com/Robbyant/lingbot-va/blob/661d52a59dc634a650efcd10a79d06bbb17ea81f/evaluation/robotwin/eval_polict_client_openpi.py#L308)使用的是**seen**，你可以尝试设置`EVALUATION.instruction_type=seen`来使用**seen**指令，理论上会提高一两个点。
 
 ## 训练
 
-### 1) 训练前先预计算 T5 embedding cache
-
-使用 `scripts/precompute_text_embeds.py`，按训练 task 预计算：
+专用启动脚本（GPU 编号、LoRA 配置和超参都以变量形式暴露在脚本顶部）：
 
 ```bash
-# LIBERO
-python scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
-
-# RoboTwin
-python scripts/precompute_text_embeds.py task=robotwin_uncond_3cam_384_1e-4
+bash scripts/train_endowam_lora_uncond.sh    # Endo4DWAM base + LoRA
+bash scripts/train_endowam_lora_joint.sh     # Endo4DWAMJoint + LoRA
 ```
 
-如需多卡可用：
+续训 —— 脚本会自动扫描 `<output_dir>/checkpoints/state/step_*/` 找 step 最大的目录，
+optimizer、scheduler、dataloader 进度全部恢复：
 
 ```bash
-torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
+bash scripts/train_endowam_lora_uncond.sh --resume
 ```
 
-
-### 2) 训练（以 fastwam 为例）
-
-首次跑某个新任务时，请先把对应 `configs/data/*.yaml` 里的 `pretrained_norm_stats` 设为 `null`。
-跑完一次训练后，会在当前 run 目录生成 `dataset_stats.json`（例如 `runs/{task_name}/{run_id}/dataset_stats.json`），
-后续就可以把 `pretrained_norm_stats` 改成该文件路径。
+通用启动脚本，通过 Hydra override 驱动：
 
 ```bash
-# LIBERO
-bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
+bash scripts/train_zero1.sh <nproc_per_node> task=<task_name> [overrides...]
 
-# RoboTwin
-bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
+bash scripts/train_zero1.sh 2 task=endowam_uncond_1cam_1e-4
+bash scripts/train_zero1.sh 2 task=endowam_uncond_1cam_1e-4 learning_rate=5e-5
+bash scripts/train_zero2.sh 2 task=endowam_uncond_1cam_1e-4   # ZeRO-2，更省显存
 ```
 
-对于LIBERO，我们使用单机8卡训练。对于RoboTwin，我们使用了64卡来加速训练，你可以尝试调小卡数和训练总epoch数。
+> 通用脚本不会自动开启 LoRA；LoRA 由 `model.lora.enable` 控制，两个 `endowam_*_1cam_1e-4`
+> task config 中已默认设为 `true`。
 
-## 使用自己训练的权重推理
+`configs/data/endowam_endoscope.yaml` 有意没有设置 `pretrained_norm_stats`，所以**首次**训练
+会从数据现算 action/state 归一化统计，并写到 `runs/<...>/dataset_stats.json`。想让后续训练复用
+同一份统计，在数据配置的 `train:`（以及 `val:`）下加上 `pretrained_norm_stats: <该文件路径>`
+即可，写法可参考 `configs/data/robotwin.yaml`。
 
-`mujoco` 环境和 LIBERO 数据版本相关，最好保持一致。之后再运行 LIBERO 评测：
+单卡显存参考（base 变体，`batch_size=4`，ZeRO-1，bf16）：不开梯度检查点约 40–48 GB，
+开启 `model.mot_checkpoint_mixed_attn=true` 后约 28–35 GB。
 
-```bash
-# LIBERO
-python experiments/libero/run_libero_manager.py task={task_name} ckpt={ckpt_path}
-```
-
-我们已经把 `RoboTwin` 评测相关代码copy到了 `third_party/RoboTwin`。
-但仍需按 [RoboTwin 官方仓库](https://github.com/RoboTwin-Platform/RoboTwin) 中的教程完成安装并下载相关assets：
-再创建 policy 软链接：
-
-```bash
-ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
-```
-
-之后再运行 RoboTwin 评测：
-
-```bash
-python experiments/robotwin/run_robotwin_manager.py task={task_name} ckpt={ckpt_path}
-```
-
-
-常用 `task_name` 示例：
+## 训练输出
 
 ```text
-libero_uncond_2cam224_1e-4
-robotwin_uncond_3cam_384_1e-4
+runs/<run_root>/<run_id>/
+├── config.yaml                   # 训练时完整配置快照
+├── dataset_stats.json            # 自动生成的 action/state 归一化统计
+├── train_endowam_lora_uncond.sh  # 启动脚本副本（复现用）
+├── checkpoints/
+│   ├── weights/step_001000.pt    # MoT state_dict（含 LoRA 参数）
+│   └── state/step_001000/        # optimizer + scheduler + RNG 状态
+└── eval/step_000500_rank_000.mp4 # 左：模型预测 | 中：VAE 重建 | 右：GT
 ```
+
+`save_total_limit=1` 时只保留最新的 checkpoint，旧的 `weights/` 文件和 `state/` 目录会自动删除。
+
+## 评估
+
+`scripts/val_chunk_endowam.py` 对单个 episode 做离线验证：
+
+```bash
+python scripts/val_chunk_endowam.py \
+  --ckpt runs/endowam_uncond_lora/<run_id>/checkpoints/weights/step_080000.pt \
+  --task endowam_uncond_1cam_1e-4 \
+  --dataset_root /path/to/endowam_pseudo_z60_rot45/esophagus/rot045 \
+  --episode 144 --execution_horizon 8 --max_windows 4000 \
+  --num_video_saves 0 --gpu 0
+```
+
+输出包括：
+
+- **Per-axis 动作精度**。模型是连续 flow-matching 模型而非分类器，所以是把反归一化后的
+  预测四舍五入到 `{-1, 0, +1}` 再比较 —— 该数据集的动作本来就是离散的，这样做是合理的。
+- **与训练同款的 diffusion loss**（`loss_video` / `loss_action`）。
+- **联合视频推理**（`--num_video_saves > 0` 时对若干窗口执行）：预测视频 / VAE 重建 / GT
+  三路拼接成 mp4，并给出 PSNR / SSIM。
+
+## 关键设计说明
+
+**哪些参数在训、哪些冻结。** LoRA 只注入视频 expert，动作 expert 做全参数微调：
+
+| 组件 | 训练方式 |
+|---|---|
+| 视频 expert 基础权重（Wan2.2 预训练） | 冻结（LoRA adapter 旁路） |
+| 视频 expert LoRA 参数（`lora_A` / `lora_B`） | 训练 |
+| 动作 expert 全部参数 | 训练（无 LoRA） |
+| VAE | 冻结 |
+| 文本编码器（UMT5-XXL） | 冻结，离线预计算 |
+
+**分辨率约束。** Wan2.2 用的是 `WanVideoVAE38`，空间压缩为 **16×**（先 2× patchify，再 8× 编码器），
+DiT 还会再 patchify 2×。因此视频的高和宽都必须被 **32** 整除。默认的 256×320 满足该约束，
+同时接近原始 270×360 的宽高比，不引入形变。
 
 ## 致谢
 
-本仓库中的 RoboTwin 评测代码基于官方 [RoboTwin 仓库](https://github.com/RoboTwin-Platform/RoboTwin) 适配而来。感谢 RoboTwin 团队公开其代码仓库和相关 assets。
+本代码库基于 [FastWAM](https://github.com/yuantianyuan01/FastWAM)
+（"Fast-WAM: Do World Action Models Need Test-time Future Imagination?"）改造，感谢原作者开源。
+同时也基于 [Wan2.2](https://github.com/Wan-Video/Wan2.2)、
+[LeRobot](https://github.com/huggingface/lerobot)，以及 `third_party/` 下 vendored 的
+[RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin) 评估代码。
 
 ## BibTeX
 
-如果你觉得我们的工作有帮助，欢迎引用：
+如果本代码库对你有帮助，请引用上游的 FastWAM 论文：
 
 ```bibtex
 @article{yuan2026fastwam,

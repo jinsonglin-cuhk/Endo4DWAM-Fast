@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Generate `meta/episodes_stats.jsonl` for EndoWAM LeRobot-v2.1 datasets so that
-FastWAM's vendored LeRobot loader can read them.
+Endo4DWAM's vendored LeRobot loader can read them.
 
-FastWAM's `LeRobotDatasetMetadata.load_metadata()` (v2.1 branch) calls
+Endo4DWAM's `LeRobotDatasetMetadata.load_metadata()` (v2.1 branch) calls
 `load_episodes_stats()` which reads `meta/episodes_stats.jsonl`. The EndoWAM
 datasets only ship `meta/stats_gr00t.json` (GR00T format), so the loader fails
 with FileNotFoundError. This script computes per-episode min/max/mean/std/count
@@ -16,7 +16,7 @@ files and writes them in the exact schema LeRobot expects:
                                               "count": [N]}}}
 
 Video / string features are intentionally skipped (LeRobot's own
-`compute_episode_stats` skips them when image stats are disabled, and FastWAM's
+`compute_episode_stats` skips them when image stats are disabled, and Endo4DWAM's
 normalizer only consumes action + state).
 
 The EndoWAM dataset is laid out as:
@@ -27,7 +27,7 @@ The EndoWAM dataset is laid out as:
 This script walks every <procedure>/rot### directory that has a meta/info.json
 and processes it.
 
-Run (use an env with pyarrow, e.g. fastwam):
+Run (use an env with pyarrow, e.g. the `fastwam` env created for the upstream repo):
     /home/user/miniconda3/envs/fastwam/bin/python scripts/build_endowam_episodes_stats.py \
         --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
 

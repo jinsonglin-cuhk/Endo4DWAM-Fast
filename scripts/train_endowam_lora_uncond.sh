@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# FastWAM (uncond) + LoRA — EndoWAM endoscope dataset
+# Endo4DWAM (uncond) + LoRA — EndoWAM endoscope dataset
 #
-# Model  : FastWAM base (action attends only first-frame video tokens)
+# Model  : Endo4DWAM base (action attends only first-frame video tokens)
 # LoRA   : injected on WanVideoDiT video expert (analogous to EndoWAM Cosmos LoRA)
 # Data   : endowam_pseudo_z60_rot45  (3 procedures × 8 rot angles = 24 LeRobot roots)
 #
@@ -24,6 +24,9 @@ NPROC_PER_NODE=2
 
 # ============================================================================
 # Run identity  (fixed so that --resume can locate the checkpoint dir)
+# NOTE: RUN_ID keeps its historical `fastwam_` prefix on purpose — existing
+# checkpoints live under runs/*/fastwam_*_endowam_rot45/, and renaming it here
+# would silently start a fresh run instead of resuming them.
 # ============================================================================
 RUN_ROOT=./runs/endowam_uncond_lora
 RUN_ID=fastwam_uncond_lora_endowam_rot45

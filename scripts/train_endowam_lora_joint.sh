@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# FastWAM-Joint + LoRA — EndoWAM endoscope dataset
+# Endo4DWAM-Joint + LoRA — EndoWAM endoscope dataset
 #
-# Model  : FastWAMJoint (action attends full video sequence)
+# Model  : Endo4DWAMJoint (action attends full video sequence)
 # LoRA   : injected on WanVideoDiT video expert (analogous to EndoWAM Cosmos LoRA)
 # Data   : endowam_pseudo_z60_rot45  (3 procedures × 8 rot angles = 24 LeRobot roots)
 #
@@ -24,6 +24,9 @@ NPROC_PER_NODE=2
 
 # ============================================================================
 # Run identity  (fixed so that --resume can locate the checkpoint dir)
+# NOTE: RUN_ID keeps its historical `fastwam_` prefix on purpose — existing
+# checkpoints live under runs/*/fastwam_*_endowam_rot45/, and renaming it here
+# would silently start a fresh run instead of resuming them.
 # ============================================================================
 RUN_ROOT=./runs/endowam_joint_lora
 RUN_ID=fastwam_joint_lora_endowam_rot45
@@ -32,7 +35,7 @@ RUN_ID=fastwam_joint_lora_endowam_rot45
 # LoRA configuration  (matches EndoWAM defaults)
 # ============================================================================
 # EndoWAM Cosmos targets:    to_q, to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2
-# FastWAM Wan DiT equivalents:
+# Endo4DWAM Wan DiT equivalents:
 #   self-attn    → self_attn.{q,k,v,o}
 #   cross-attn   → cross_attn.{q,k,v,o}
 #   FFN up/down  → ffn.0, ffn.2

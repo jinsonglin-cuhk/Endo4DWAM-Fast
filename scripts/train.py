@@ -1,8 +1,8 @@
 import hydra
 from omegaconf import DictConfig
 
-from fastwam.runtime import run_training
-from fastwam.utils.config_resolvers import register_default_resolvers
+from endo4dwam.runtime import run_training
+from endo4dwam.utils.config_resolvers import register_default_resolvers
 
 register_default_resolvers()
 

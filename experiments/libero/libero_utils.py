@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 import numpy as np
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv
-from fastwam.utils.video_io import save_mp4
+from endo4dwam.utils.video_io import save_mp4
 
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")

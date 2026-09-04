@@ -2,7 +2,7 @@
 
 defaults:
   - override /data: robotwin
-  - override /model: fastwam
+  - override /model: endo4dwam
   - _self_
 
 # dataloading

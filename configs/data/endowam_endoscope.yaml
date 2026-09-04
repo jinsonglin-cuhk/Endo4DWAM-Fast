@@ -1,4 +1,4 @@
-# EndoWAM endoscope dataset (pseudo-action OBB, z60, rot45 augmented) for FastWAM.
+# EndoWAM endoscope dataset (pseudo-action OBB, z60, rot45 augmented) for Endo4DWAM.
 #
 # Single camera (observation.images.endoscope), 3-DoF discrete pseudo-action
 # (m2/m3/m4 target rpm, values in {-1,0,1}, already in [-1,1]).
@@ -8,7 +8,7 @@
 # MultiLeRobotDataset (dataset_dirs accepts a list).
 #
 # IMPORTANT (do these before training):
-#   1. Generate meta/episodes_stats.jsonl for every root (FastWAM's LeRobot
+#   1. Generate meta/episodes_stats.jsonl for every root (Endo4DWAM's LeRobot
 #      loader requires it on v2.1; EndoWAM only ships stats_gr00t.json):
 #        python scripts/build_endowam_episodes_stats.py \
 #          --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
@@ -16,7 +16,7 @@
 #
 # Notes on the careful bits (input/output + normalization):
 #   - action_output_dim / proprio_output_dim = 3 (the model picks these up via
-#     ${...} interpolation in configs/model/fastwam*.yaml, so the model config
+#     ${...} interpolation in configs/model/endo4dwam*.yaml, so the model config
 #     itself needs NO changes).
 #   - delta_action_dim_mask: [false, false, false] — the actions are discrete
 #     direction commands, NOT end-effector poses. They must NOT be differenced.
@@ -27,7 +27,7 @@
 #     NOTE: WanVideoVAE38.upsampling_factor=16, NOT 8; video dims must be divisible by 32.
 
 train:
-  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  _target_: endo4dwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
     - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot000
     - /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45/ercp/rot045
@@ -79,7 +79,7 @@ train:
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"   # single camera -> squeeze branch, value unused
   processor:
-    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    _target_: endo4dwam.datasets.lerobot.processors.endo4dwam_processor.Endo4DWAMProcessor
     shape_meta: ${data.train.shape_meta}
     num_obs_steps: ${data.train.num_frames}
     num_output_cameras: 1
@@ -95,14 +95,14 @@ train:
     norm_exception_mode: null
 
     action_state_merger:
-      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+      _target_: endo4dwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
 
     train_transforms:
-      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: endo4dwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [256, 320]
     val_transforms:
-      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: endo4dwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [256, 320]
   text_embedding_cache_dir: ./data/text_embeds_cache/endowam

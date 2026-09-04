@@ -1,1 +1,1 @@
-"""CLI entry scripts for fastwam."""
+"""CLI entry scripts for endo4dwam."""

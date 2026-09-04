@@ -1,5 +1,5 @@
 train:
-  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  _target_: endo4dwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
     - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
     - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
@@ -35,7 +35,7 @@ train:
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
   processor:
-    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    _target_: endo4dwam.datasets.lerobot.processors.endo4dwam_processor.Endo4DWAMProcessor
     shape_meta: ${data.train.shape_meta}
     num_obs_steps: ${data.train.num_frames}
     num_output_cameras: 2
@@ -47,20 +47,20 @@ train:
     # action & state normalization
     action_state_transforms: null
     # action_state_transforms:
-    #   - _target_: fastwam.datasets.lerobot.transforms.libero.LiberoTransform
+    #   - _target_: endo4dwam.datasets.lerobot.transforms.libero.LiberoTransform
     use_stepwise_action_norm: False
     norm_default_mode: min/max
     norm_exception_mode: null
 
     action_state_merger:
-      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+      _target_: endo4dwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
 
     train_transforms:
-      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: endo4dwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
     val_transforms:
-      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: endo4dwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
   text_embedding_cache_dir: ./data/text_embeds_cache/libero

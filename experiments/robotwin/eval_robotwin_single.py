@@ -4,12 +4,12 @@ RobotWin single-task evaluation entrypoint (Hydra).
 Features:
 - Read `configs/sim_robotwin.yaml`.
 - Check or create the symlink:
-  `RoboTwin/policy/fastwam -> experiments/robotwin/fastwam`.
+  `RoboTwin/policy/endo4dwam -> experiments/robotwin/endo4dwam`.
 - Forward config overrides to the official RoboTwin entrypoint
   `script/eval_policy.py` and save logs.
 
 Common arguments:
-- `ckpt`: path to the FastWAM checkpoint (required).
+- `ckpt`: path to the Endo4DWAM checkpoint (required).
 - `EVALUATION.task_name`: task name to evaluate (required).
 - `gpu_id`: sets `CUDA_VISIBLE_DEVICES`.
 
@@ -41,7 +41,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-POLICY_NAME = "fastwam_policy"
+POLICY_NAME = "endo4dwam_policy"
 
 
 def _resolve_path(path_str: str, *, base: Path) -> Path:

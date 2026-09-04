@@ -15,7 +15,7 @@ model:
 
 EVALUATION:
   robotwin_root: third_party/RoboTwin
-  policy_name: fastwam_policy
+  policy_name: endo4dwam_policy
   task_name: null
   task_config: demo_randomized
   instruction_type: unseen

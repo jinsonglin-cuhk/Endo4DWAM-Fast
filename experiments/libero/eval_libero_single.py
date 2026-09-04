@@ -35,10 +35,10 @@ from experiments.libero.libero_utils import (
     save_prediction_video,
     save_rollout_video,
 )
-from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
-from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
-from fastwam.utils.pytorch_utils import set_global_seed
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from endo4dwam.datasets.lerobot.processors.endo4dwam_processor import Endo4DWAMProcessor
+from endo4dwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from endo4dwam.utils.pytorch_utils import set_global_seed
+from endo4dwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
 from action_ensembler import ActionEnsembler
 
@@ -166,7 +166,7 @@ def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarra
 
 def _normalize_proprio(
     proprio: np.ndarray,
-    processor: FastWAMProcessor,
+    processor: Endo4DWAMProcessor,
 ) -> torch.Tensor:
     state_meta = processor.shape_meta["state"]
     if len(state_meta) != 1:
@@ -184,7 +184,7 @@ def _normalize_proprio(
 def _obs_to_model_input(
     obs: dict,
     cfg: DictConfig,
-    processor: FastWAMProcessor,
+    processor: Endo4DWAMProcessor,
     width: int,
     height: int,
     device: str,
@@ -256,7 +256,7 @@ def _extract_sim_state(obs: dict) -> np.ndarray:
     return state
 
 
-def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np.ndarray:
+def _denormalize_action(action: torch.Tensor, processor: Endo4DWAMProcessor) -> np.ndarray:
     if action.ndim == 2:
         action = action.unsqueeze(0)
     if action.ndim != 3:
@@ -360,7 +360,7 @@ def _predict_action_chunk(
     obs: dict,
     task_description: str,
     model: torch.nn.Module,
-    processor: FastWAMProcessor,
+    processor: Endo4DWAMProcessor,
     cfg: DictConfig,
     *,
     action_horizon: int,
@@ -447,7 +447,7 @@ def run_single_episode(
     initial_state,
     task_description: str,
     model: torch.nn.Module,
-    processor: FastWAMProcessor,
+    processor: Endo4DWAMProcessor,
     cfg: DictConfig,
     episode_idx: int,
     *,
@@ -585,7 +585,7 @@ def run_single_task(
     task,
     initial_states,
     model: torch.nn.Module,
-    processor: FastWAMProcessor,
+    processor: Endo4DWAMProcessor,
     cfg: DictConfig,
     video_dir: Path,
     predicted_video_dir: Path,
@@ -703,7 +703,7 @@ def eval_single_process(cfg: DictConfig):
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
-    processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
+    processor: Endo4DWAMProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
     logging.info("Using dataset stats: %s", dataset_stats_path)
 

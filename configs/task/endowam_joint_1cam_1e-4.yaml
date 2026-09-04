@@ -1,8 +1,8 @@
 # @package _global_
 #
-# FastWAM-Joint baseline on the EndoWAM endoscope dataset.
+# Endo4DWAM-Joint baseline on the EndoWAM endoscope dataset.
 # Same data config as the uncond variant; only the model differs
-# (configs/model/fastwam_joint.yaml). action_dim (3) / proprio_dim (3) are
+# (configs/model/endo4dwam_joint.yaml). action_dim (3) / proprio_dim (3) are
 # pulled from the data config via ${...} interpolation, so the model config
 # needs no edits.
 #
@@ -24,7 +24,7 @@
 
 defaults:
   - override /data: endowam_endoscope
-  - override /model: fastwam_joint
+  - override /model: endo4dwam_joint
   - _self_
 
 # dataloading
@@ -51,10 +51,10 @@ weight_decay: 1e-2
 resume: null
 save_total_limit: 1   # keep only the latest checkpoint, matching EndoWAM save_total_limit=1
 
-# NOTE on EndoWAM params with NO FastWAM equivalent:
-#   - LoRA (rank16/alpha32/dropout/target_modules): FastWAM does FULL fine-tuning
+# NOTE on EndoWAM params with NO Endo4DWAM equivalent:
+#   - LoRA (rank16/alpha32/dropout/target_modules): Endo4DWAM does FULL fine-tuning
 #     of the DiT (MoT), no PEFT path exists. See trainer._apply_dit_only_train_mode.
-#   - save_total_limit: not supported; FastWAM keeps every checkpoint under
+#   - save_total_limit: not supported; Endo4DWAM keeps every checkpoint under
 #     runs/<task>/<run_id>/checkpoints/. Prune manually if disk is tight.
 #   - freeze text_encoder/vae: already the default here (load_text_encoder=false,
 #     only DiT is trainable), so no flag needed.

@@ -173,6 +173,7 @@ def create_endo4dwam(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    geometry=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -214,6 +215,12 @@ def create_endo4dwam(
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
 
+    if isinstance(geometry, DictConfig):
+        geometry = OmegaConf.to_container(geometry, resolve=True)
+    if geometry is None:
+        geometry = {}
+    if not isinstance(geometry, dict):
+        raise ValueError(f"`geometry` must resolve to a dict, got {type(geometry)}")
     if isinstance(loss, DictConfig):
         loss = OmegaConf.to_container(loss, resolve=True)
     if loss is None:
@@ -243,6 +250,9 @@ def create_endo4dwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_depth=float(loss.get("lambda_depth", 0.0)),
+        loss_lambda_flow=float(loss.get("lambda_flow", 0.0)),
+        geometry_config=geometry,
     )
     if lora is not None:
         _apply_lora_to_video_expert(model, lora)
@@ -262,6 +272,7 @@ def create_endo4dwam_joint(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    geometry=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -303,6 +314,12 @@ def create_endo4dwam_joint(
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
 
+    if isinstance(geometry, DictConfig):
+        geometry = OmegaConf.to_container(geometry, resolve=True)
+    if geometry is None:
+        geometry = {}
+    if not isinstance(geometry, dict):
+        raise ValueError(f"`geometry` must resolve to a dict, got {type(geometry)}")
     if isinstance(loss, DictConfig):
         loss = OmegaConf.to_container(loss, resolve=True)
     if loss is None:
@@ -332,6 +349,9 @@ def create_endo4dwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_depth=float(loss.get("lambda_depth", 0.0)),
+        loss_lambda_flow=float(loss.get("lambda_flow", 0.0)),
+        geometry_config=geometry,
     )
     if lora is not None:
         _apply_lora_to_video_expert(model, lora)
@@ -351,6 +371,7 @@ def create_endo4dwam_idm(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    geometry=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -394,6 +415,12 @@ def create_endo4dwam_idm(
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
 
+    if isinstance(geometry, DictConfig):
+        geometry = OmegaConf.to_container(geometry, resolve=True)
+    if geometry is None:
+        geometry = {}
+    if not isinstance(geometry, dict):
+        raise ValueError(f"`geometry` must resolve to a dict, got {type(geometry)}")
     if isinstance(loss, DictConfig):
         loss = OmegaConf.to_container(loss, resolve=True)
     if loss is None:
@@ -423,6 +450,9 @@ def create_endo4dwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_depth=float(loss.get("lambda_depth", 0.0)),
+        loss_lambda_flow=float(loss.get("lambda_flow", 0.0)),
+        geometry_config=geometry,
     )
     if lora is not None:
         _apply_lora_to_video_expert(model, lora)

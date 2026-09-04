@@ -60,8 +60,34 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
+# Training-only geometry / motion readout (WAM4D-style spatial registers).
+# Removed entirely at inference; `enable: false` is bit-identical to no branch.
+# register_grid must equal the DiT token grid: video_size / 16 (VAE) / 2 (patch).
+# num_supervised_steps is the number of FUTURE latent steps = T_lat - K.
+geometry:
+  enable: false
+  capture_layers: [12, 14, 16, 18]   # WAM4D Table 7: middle layers won
+  geo_dim: 1024                      # == DA3 DPT dim_in, so no adapter is needed
+  num_heads: 8                       # 1024 / 8 = 128; the video expert's 24 does not divide 1024
+  register_grid: [8, 10]             # 256x320 -> 8x10 cells of 32x32 px
+  num_supervised_steps: 4            # T_lat 5 - K 1
+  depth:
+    enable: true
+  motion:
+    enable: true
+  head:
+    model_id: depth-anything/DA3MONO-LARGE   # same source as the depth teacher
+    patch_size: 32                           # 8x10 tokens -> 256x320
+    freeze: false                            # WAM4D Table 8: trainable pretrained won
+
 loss:
   lambda_action: 1.0
+  # Geometry readout weights. Deliberately below WAM4D's lambda_depth=1: our depth is
+  # a domain-shifted DA3 pseudo-label, our flow a RAFT pseudo-label and our action a
+  # pseudo-action, so the raw loss scales are not the paper's. Start small and watch
+  # the gradient-norm ratio on the shared history features, not the loss values.
+  lambda_depth: 0.0
+  lambda_flow: 0.0
 
 # LoRA for video expert (WanVideoDiT).  Mirrors EndoWAM: rank=16, alpha=32, dropout=0.05.
 # Target modules are the Wan DiT equivalents of Cosmos targets

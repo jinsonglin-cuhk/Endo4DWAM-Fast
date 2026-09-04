@@ -38,6 +38,9 @@ class Endo4DWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_depth: float = 0.0,
+        loss_lambda_flow: float = 0.0,
+        geometry_config: Optional[dict] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -45,6 +48,7 @@ class Endo4DWAM(torch.nn.Module):
         self.mot = mot
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
         self.dit = self.mot
+        self.geometry_config = dict(geometry_config or {})
 
         self.vae = vae
         self.text_encoder = text_encoder
@@ -84,6 +88,10 @@ class Endo4DWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_depth = float(loss_lambda_depth)
+        self.loss_lambda_flow = float(loss_lambda_flow)
+
+        self._maybe_build_geometry()
 
         self.to(self.device)
 
@@ -111,6 +119,9 @@ class Endo4DWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_depth: float = 0.0,
+        loss_lambda_flow: float = 0.0,
+        geometry_config: Optional[dict] = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for Endo4DWAM.from_wan22_pretrained().")
@@ -168,6 +179,9 @@ class Endo4DWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            loss_lambda_depth=loss_lambda_depth,
+            loss_lambda_flow=loss_lambda_flow,
+            geometry_config=geometry_config,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -407,6 +421,67 @@ class Endo4DWAM(torch.nn.Module):
         tf = int(self.vae.temporal_downsample_factor)
         return tf * (self.num_history_latent_frames - 1) + 1
 
+    def _maybe_build_geometry(self) -> None:
+        """Attach the training-only geometry readout, if enabled.
+
+        Attached to `self.mot` (not to `self`) on purpose: modules under
+        `model.dit` whose names lack "mixtures.video." become trainable and get
+        checkpointed with no trainer change, while anything hung off the
+        top-level model would be silently frozen by `requires_grad_(False)` and
+        never saved. See geometry_branch.py for the full rule.
+        """
+        cfg = self.geometry_config
+        if not cfg or not cfg.get("enable", False):
+            return
+        from .geometry_branch import build_geometry_branch
+        from .helpers.da3_head import build_da3_head
+
+        grid = cfg.get("register_grid")
+        if not grid:
+            raise ValueError("`geometry.register_grid` (H, W in register cells) is required.")
+        num_spatial = int(grid[0]) * int(grid[1])
+        num_time = int(cfg.get("num_supervised_steps", 0))
+        if num_time <= 0:
+            raise ValueError("`geometry.num_supervised_steps` must be > 0.")
+
+        self.mot.geometry = build_geometry_branch(
+            cfg, video_dim=int(self.video_expert.hidden_dim),
+            num_spatial=num_spatial, num_time=num_time,
+            device=self.device, dtype=self.torch_dtype,
+        )
+        head_cfg = cfg.get("head", {})
+        patch = int(head_cfg.get("patch_size", 32))
+        if self.mot.geometry.depth is not None:
+            head, _ = build_da3_head(head_cfg.get("model_id", "depth-anything/DA3MONO-LARGE"),
+                                     patch_size=patch, device=self.device, dtype=self.torch_dtype,
+                                     freeze=bool(head_cfg.get("freeze", False)))
+            self.mot.geometry.depth_head = head
+        if self.mot.geometry.motion is not None:
+            head, _ = build_da3_head(head_cfg.get("model_id", "depth-anything/DA3MONO-LARGE"),
+                                     patch_size=patch, output_dim=2, device=self.device,
+                                     dtype=self.torch_dtype,
+                                     freeze=bool(head_cfg.get("freeze", False)))
+            self.mot.geometry.motion_head = head
+
+    @property
+    def geometry(self):
+        return getattr(self.mot, "geometry", None)
+
+    def _run_geometry(self, sample) -> bool:
+        """Gate for the geometry branch.
+
+        `self.mot.training`, NOT `self.training`: the trainer calls model.eval()
+        then model.dit.train(), so during training the top-level module reports
+        training=False. Gating on self.training would silently disable the whole
+        branch for an entire run without raising anything.
+        """
+        return (
+            self.geometry is not None
+            and self.mot.training
+            and torch.is_grad_enabled()
+            and any(k in sample for k in ("depth", "flow"))
+        )
+
     @torch.no_grad()
     def _build_mot_attention_mask(
         self,
@@ -529,6 +604,8 @@ class Endo4DWAM(torch.nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
         )
+        run_geometry = self._run_geometry(sample)
+        geo_captures: dict[int, torch.Tensor] = {}
         tokens_out = self.mot(
             embeds_all={
                 "video": video_tokens,
@@ -553,6 +630,8 @@ class Endo4DWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            capture_layers=self.geometry.capture_layers if run_geometry else None,
+            capture_out=geo_captures if run_geometry else None,
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -590,11 +669,65 @@ class Endo4DWAM(torch.nn.Module):
         loss_action = (action_loss_per_sample * action_weight).mean()
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+
+        # `loss_depth` / `loss_flow` are emitted on EVERY rank on EVERY step, even
+        # when the branch is off. trainer.py builds a tensor per key and all-gathers
+        # it; if one rank omitted a key the ranks would disagree on the key set and
+        # the collective would deadlock.
+        loss_depth, loss_flow = self._geometry_losses(sample, geo_captures, video_pre) \
+            if run_geometry else (None, None)
+        if loss_depth is not None:
+            loss_total = loss_total + self.loss_lambda_depth * loss_depth
+        if loss_flow is not None:
+            loss_total = loss_total + self.loss_lambda_flow * loss_flow
+
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_depth": self.loss_lambda_depth * float(loss_depth.detach().item()) if loss_depth is not None else 0.0,
+            "loss_flow": self.loss_lambda_flow * float(loss_flow.detach().item()) if loss_flow is not None else 0.0,
         }
         return loss_total, loss_dict
+
+    def _geometry_losses(self, sample, captures, video_pre):
+        """Depth / motion readout losses. Returns (loss_depth | None, loss_flow | None)."""
+        from .geometry_losses import clip_shared_affine_depth_loss, flow_loss
+
+        branch = self.geometry
+        tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        history_tokens = tokens_per_frame * self.num_history_latent_frames
+        history = branch.history_slices(captures, history_tokens)
+        grid = self.geometry_config["register_grid"]
+        gh, gw = int(grid[0]), int(grid[1])
+
+        def decode(stack, head, levels_owner):
+            levels = stack(history)
+            feats = [[lvl] for lvl in levels]
+            b, s = levels[0].shape[0], levels[0].shape[1]
+            out = head(feats, H=gh * head.patch_size, W=gw * head.patch_size, patch_start_idx=0)
+            return out, b, s
+
+        loss_depth = None
+        if branch.depth is not None and "depth" in sample:
+            out, _, _ = decode(branch.depth, branch.depth_head, "depth")
+            pred = out["depth"]
+            target = sample["depth"].to(device=pred.device, dtype=pred.dtype)
+            weight = sample.get("depth_mask")
+            weight = None if weight is None else weight.to(device=pred.device, dtype=pred.dtype)
+            loss_depth, _, _ = clip_shared_affine_depth_loss(pred, target, weight)
+
+        loss_flow = None
+        if branch.motion is not None and "flow" in sample:
+            out, _, _ = decode(branch.motion, branch.motion_head, "motion")
+            pred = out["depth"]                       # DPT names its main output "depth"
+            if pred.dim() == 4:                       # [B,S,H,W] -> [B,S,1,H,W]
+                pred = pred.unsqueeze(2)
+            target = sample["flow"].to(device=pred.device, dtype=pred.dtype)
+            mask = sample.get("flow_mask")
+            mask = None if mask is None else mask.to(device=pred.device, dtype=pred.dtype)
+            loss_flow = flow_loss(pred, target, mask)
+
+        return loss_depth, loss_flow
 
     @torch.no_grad()
     def _predict_joint_noise(

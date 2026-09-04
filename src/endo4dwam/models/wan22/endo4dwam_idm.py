@@ -347,14 +347,7 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        if self.num_history_latent_frames != 1:
-            raise NotImplementedError(
-                "Inference currently conditions on a single history frame, but the model was "
-                f"built with num_history_latent_frames={self.num_history_latent_frames}. "
-                "Training with K>1 and running inference with K=1 would be a train/test "
-                "mismatch, so this raises instead of silently producing it."
-            )
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        latents_video[:, :, 0:self.num_history_latent_frames] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -404,14 +397,7 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
                 fuse_vae_embedding_in_latents=fuse_flag,
             )
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
-            if self.num_history_latent_frames != 1:
-                raise NotImplementedError(
-                    "Inference currently conditions on a single history frame, but the model was "
-                    f"built with num_history_latent_frames={self.num_history_latent_frames}. "
-                    "Training with K>1 and running inference with K=1 would be a train/test "
-                    "mismatch, so this raises instead of silently producing it."
-                )
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:self.num_history_latent_frames] = first_frame_latents.clone()
 
         # Stage 2: freeze denoised video as cond and denoise action via video K/V cache.
         timestep_video_cond = torch.zeros(

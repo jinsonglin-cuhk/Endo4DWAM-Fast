@@ -254,11 +254,20 @@ class Endo4DWAM(torch.nn.Module):
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [N,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
+        expected = self.num_history_pixel_frames
+        if input_image.shape[0] != expected:
+            raise ValueError(
+                f"`input_image` must supply {expected} history frame(s) for "
+                f"num_history_latent_frames={self.num_history_latent_frames}, "
+                f"got {input_image.shape[0]}. K latent frames need "
+                f"temporal_downsample_factor*(K-1)+1 pixel frames."
+            )
+        # [N,3,H,W] -> [3,N,H,W]; N=1 reproduces the original single-frame path.
+        image = input_image.to(device=self.device).permute(1, 0, 2, 3)
         z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if isinstance(z, list):
             z = z[0].unsqueeze(0)
@@ -386,6 +395,17 @@ class Endo4DWAM(torch.nn.Module):
     def num_history_latent_frames(self) -> int:
         """Leading latent frames kept clean as history (1 = original behaviour)."""
         return int(getattr(self.video_expert, "num_history_latent_frames", 1))
+
+    @property
+    def num_history_pixel_frames(self) -> int:
+        """Pixel frames needed to produce `num_history_latent_frames` clean latent frames.
+
+        The VAE groups pixel frames as lat0 <- pix0 alone and lat_j (j>=1) <-
+        pix[tf*j-(tf-1) .. tf*j] (measured, P0), i.e. T_lat = (T_pix-1)//tf + 1,
+        so K latent frames need tf*(K-1)+1 pixel frames -- 5 for K=2, not 2.
+        """
+        tf = int(self.vae.temporal_downsample_factor)
+        return tf * (self.num_history_latent_frames - 1) + 1
 
     @torch.no_grad()
     def _build_mot_attention_mask(
@@ -828,14 +848,7 @@ class Endo4DWAM(torch.nn.Module):
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        if self.num_history_latent_frames != 1:
-            raise NotImplementedError(
-                "Inference currently conditions on a single history frame, but the model was "
-                f"built with num_history_latent_frames={self.num_history_latent_frames}. "
-                "Training with K>1 and running inference with K=1 would be a train/test "
-                "mismatch, so this raises instead of silently producing it."
-            )
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        latents_video[:, :, 0:self.num_history_latent_frames] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -903,14 +916,7 @@ class Endo4DWAM(torch.nn.Module):
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
-            if self.num_history_latent_frames != 1:
-                raise NotImplementedError(
-                    "Inference currently conditions on a single history frame, but the model was "
-                    f"built with num_history_latent_frames={self.num_history_latent_frames}. "
-                    "Training with K>1 and running inference with K=1 would be a train/test "
-                    "mismatch, so this raises instead of silently producing it."
-                )
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:self.num_history_latent_frames] = first_frame_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         if test_action_with_infer_action:

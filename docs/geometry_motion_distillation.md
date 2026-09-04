@@ -147,11 +147,63 @@ MONO 逐帧推理下，一个 clip 内共享一组 $(s,b)$ 的残差是逐帧最
 
 已产出的深度是方形 `224×224`，而源是 360×480（比例 0.750）、训练管线是 256×320（比例 0.800）。我用 corr 区分"整幅压扁"与"中心裁剪"得到 0.6444 vs 0.6423，**差异太小，无法判定**。这个变换必须由生成侧明确记录进 `depth_meta`，否则监督对齐无从保证（见 v2 变更清单 #9）。
 
+### P0 补完：latent 映射、DPT 头、光流（2026-09-04 晚）
+
+**1. pixel ↔ latent 映射（实测，推翻原假设）**
+
+扰动单个像素帧再重编码，17 帧 256×320：
+
+```
+lat0 ← pix0 (仅此一帧)   lat1 ← pix1-4   lat2 ← pix5-8   lat3 ← pix9-12   lat4 ← pix13-16
+```
+
+- 严格因果（无像素帧影响更早的 latent 步），但**感受野向前泄漏 2–4 步**（pix0 仍影响 lat0..lat3）。
+- **每组内 argmax 是该组第一帧而非最后一帧**（lat1: pix1=0.850 vs pix4=0.756）。
+  ⇒ 监督时刻应取 **pix 1/5/9/13**，原方案写的 4/8/12/16 是错的。组内各帧贡献相当（0.76–0.95），取任一帧都可辩护。
+- K 个 clean latent 帧 = 前 4(K−1)+1 个像素帧；**K=2 ⇒ 5 帧 history，future 监督步从 4 降到 3**。
+
+**2. history 帧数已参数化（代码已落地）**
+
+`WanVideoDiT` 新增 `num_history_latent_frames`（默认 1，与旧实现逐位一致），
+`first_frame_causal` 泛化为 K 帧 history 块（别名 `first_k_frames_causal`）。
+`Endo4DWAM` 的 action→history mask、`build_inputs` 的 history 切片、`training_loss` 的丢弃步数，
+以及 IDM 两条分支都已跟着参数化。`_compute_video_loss_per_sample` 的
+`include_initial_video_step: bool` 改为 `num_dropped_latent_steps: int`（bool 表达不了 K>1）。
+**推理仍只支持单帧 history，K>1 时四条 infer 路径显式报错**，避免训练/推理不一致被静默引入。
+
+**3. 几何头：改用 MONO 的 `DPT`，不是论文的 `DualDPT`**
+
+教师换成 MONO-LARGE 后，头也应同源。实测：
+
+| 项 | 结果 |
+|---|---|
+| MONO head 类 | **`DPT`**（`DualDPT` 是 GIANT-1.1 anyview 分支用的） |
+| 配置 | `dim_in=1024, output_dim=1, features=256, out_channels=[256,512,1024,1024]` |
+| 参数量 | **29.8M**（DualDPT 约 47M/头） |
+| 权重加载 | **missing=0 / unexpected=0**，抽样键与文件逐位一致 |
+| `patch_size=32` | 正好产出 256×320，与 register 网格 8×10 对齐 |
+| 显存（前向+反向，bf16） | batch4×3步 **1.086 GiB**；batch4×4步 1.481 GiB |
+
+**`dim_in=1024` 正好等于选定的 `geo_dim=1024`**，register 输出可直接接入。
+输出含一个用不到的 `sky` 头，可关掉再省。
+
+**4. 光流：两个影响设计的发现**
+
+- **69% 的帧几乎静止**（幅度 < 0.002 归一化 ≈ 0.2px@112；p50=0.00083、p90=0.0153、p99=0.0589）。
+  运动监督的目标**绝大多数是零**，模型预测全零即可拿到低 loss。λ_flow 的调法与是否按运动幅度采样需要据此设计。
+- **方向/步长约定从数据判不明确**：在高运动帧上用光度 warp 检验，`t→t+1` 在 4/6 情形最优（+7.2%/+28.3%/+18.0%/+22.0%），
+  `t→t+2` 在 2/6 最优（+3.3%/+0.9%），而 `flow_meta` 写的是 `stride: 2`。**须由生成侧确认**，dataloader 依赖这个约定。
+- **StereoMIS 的 RAFT 不是内镜微调版**（只是官方 RAFT 仓库副本 + 标准 `raft-things.pth`）。
+  原方案说它「可能更贴内镜域」是错的；已在用的 `C_T_SKHT_V2` 反而训练更充分，**无可换项**。
+
 ### P0 剩余项
 
-- RAFT 两版内镜对比（未做）
-- DualDPT head 权重加载 + 训练侧显存实测（未做）
-- **pixel frame ↔ latent timestep 真实映射**（未做，见 v2 变更清单 #18）
+~~RAFT 两版对比~~、~~几何头加载 + 显存实测~~、~~pixel↔latent 映射~~ —— **均已完成，见上一节**。
+
+仍未定：
+- **flow 的方向/步长约定**（须生成侧确认）
+- **深度的几何变换**（`224×224` 方形 vs 源 0.750 / 训练 0.800，须写进 `depth_meta`）
+- ureter 深度的 per-clip 门控阈值需在完整数据上标定
 
 ---
 

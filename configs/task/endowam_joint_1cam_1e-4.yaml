@@ -1,0 +1,60 @@
+# @package _global_
+#
+# FastWAM-Joint baseline on the EndoWAM endoscope dataset.
+# Same data config as the uncond variant; only the model differs
+# (configs/model/fastwam_joint.yaml). action_dim (3) / proprio_dim (3) are
+# pulled from the data config via ${...} interpolation, so the model config
+# needs no edits.
+#
+# In the joint variant the action tokens attend to the FULL predicted video
+# sequence (not just the first frame) — the stronger "test-time future
+# imagination" baseline to contrast against the uncond one.
+#
+# Workflow (run in order):
+#   1. One-time: generate per-episode stats so the LeRobot loader accepts v2.1:
+#        python scripts/build_endowam_episodes_stats.py \
+#          --data_root /mnt/data2/ljs/EndoWAM/dataset/endowam_pseudo_z60_rot45
+#
+#   2. Precompute the T5 text-embedding cache (shares the same prompts/cache dir
+#      as the uncond task, so this is a no-op if already run):
+#        python scripts/precompute_text_embeds.py task=endowam_joint_1cam_1e-4
+#
+#   3. Train (first run auto-generates dataset_stats.json):
+#        bash scripts/train_zero1.sh 2 task=endowam_joint_1cam_1e-4
+
+defaults:
+  - override /data: endowam_endoscope
+  - override /model: fastwam_joint
+  - _self_
+
+# dataloading
+batch_size: 4
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+  lora:
+    enable: true   # LoRA on video expert; rank/alpha/dropout/target_modules from model config defaults
+
+# scheduler (aligned with EndoWAM train_endowam_causal_gaze_latent.sh)
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10            # ignored: max_steps below takes precedence (trainer.py:205)
+max_steps: 40000          # = EndoWAM trainer.max_train_steps
+log_every: 10
+save_every: 1000          # = EndoWAM trainer.save_interval
+eval_every: 500           # = EndoWAM trainer.eval_interval
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+save_total_limit: 1   # keep only the latest checkpoint, matching EndoWAM save_total_limit=1
+
+# NOTE on EndoWAM params with NO FastWAM equivalent:
+#   - LoRA (rank16/alpha32/dropout/target_modules): FastWAM does FULL fine-tuning
+#     of the DiT (MoT), no PEFT path exists. See trainer._apply_dit_only_train_mode.
+#   - save_total_limit: not supported; FastWAM keeps every checkpoint under
+#     runs/<task>/<run_id>/checkpoints/. Prune manually if disk is tight.
+#   - freeze text_encoder/vae: already the default here (load_text_encoder=false,
+#     only DiT is trainable), so no flag needed.

@@ -53,13 +53,70 @@ if self.video_attention_mask_mode == "first_frame_causal":
 ## 已验证的事实（P0 已完成部分）
 
 - **rot### 之间没有解析复用捷径**（实测）。把 rot000 旋转 45°/90° 匹配 rot045/rot090，MAE 53.67/67.20，**比不旋转的 39.44/66.80 还差**；同视频相邻帧 MAE 仅 0.75。伪标签必须逐 root 算。
-- **24 roots 合计 7,836,512 帧**。按假设吞吐（**尚未实测**）GIANT ~145 GPU-h、BASE ~54、RAFT ~44。8 张 A6000 当前全部 100% 占用、每卡仅剩 16–19GB。
+- **24 roots 合计 7,836,512 帧**。**实测** DA3 最佳 6.60 fps（B=16）⇒ 全量 **330 GPU-h**；rot000 子集+步长4 为 10.3 GPU-h。8 张 A6000 当前全部 100% 占用、每卡仅剩 16–19GB。
 - **开关必须用 `self.mot.training`**（实测）：训练中 `model.training=False` 而 `model.mot.training=True`（`trainer.py:291-293` 先 `model.eval()` 再 `model.dit.train()`）。用 `self.training` 会让分支整轮静默不训练。
 - **`loss_dict` 新 key 必须每 rank 每步无条件发出**，否则 `trainer.py:750-754` 的 all-gather 因 key 集合不一致而死锁。
 - **模块挂 `self.mot` 下且名字不含 `mixtures.video.`** → 自动可训练 + 自动进 checkpoint，trainer 零改动。挂顶层会被静默冻结，挂 video expert 内会被 LoRA 规则静默冻结。
 - **`save_total_limit: 1` 会删掉现有 checkpoint**（`trainer._rotate_checkpoints`）。开工前必须先把 warm-start 权重复制走，且 `resume` 只能给 `.pt` 文件路径（目录路径走 DeepSpeed 严格加载必挂）。
 - **env 分工**：`DAv3`（有 DA3 + cv2/decord/imageio）跑离线伪标签；`fastwam`（有 av）跑训练。`DAv3` 的 `depth_anything_3` 指向 `/mnt/data2/ljs/Depth-Anything-3`，**不是** beilei 那份，API 不同，行号需重新对齐。
 - 本地已缓存 `DA3-BASE` / `DA3MONO-LARGE` / `DA3NESTED-GIANT-LARGE` / `DA3NESTED-GIANT-LARGE-1.1`。
+
+---
+
+## P0 实测结果（已完成，2026-09-04）
+
+### 结论摘要
+
+| 项 | 结果 |
+|---|---|
+| DA3 显存 | 加载 6.4 GiB，B=16 峰值 10.4 GiB —— 在每卡 16–19GB 空闲里宽裕 |
+| **真实吞吐** | 最佳 B=16 @ **6.60 fps**（方案原假设 15 fps，**乐观了 2.3 倍**） |
+| **全量代价** | 7,836,512 帧 → **330 GPU-hours**（原估 145） |
+| rot000 子集 + 步长4 | 245k 帧 → **10.3 GPU-hours**，可行 |
+| **深度教师** | **必须从 GIANT-1.1 换成 `DA3MONO-LARGE`**（见下） |
+
+### 深度符号 QC：一个必须进流水线的检验
+
+内镜有个可靠的客观判据：**光照随距离衰减 ⇒ 亮 = 近**。因此语义正确的深度应满足 `corr(depth, 亮度) < 0`。实测 3 术式 × 5 episode × 4 帧：
+
+| 配置 | 符号反转 | 平均相关 |
+|---|---|---|
+| DA3 GIANT-1.1 多视图 | **6/15** | −0.129 |
+| DA3 GIANT-1.1 逐帧 | **6/15** | −0.133 |
+| **DA3MONO-LARGE 逐帧** | **3/15** | **−0.457** |
+
+逐术式（GIANT 多视图 → MONO）：
+
+- **ercp：5/5 符号反转（+0.43~+0.63）→ MONO 后 0/5 反转（−0.69~−0.81）**。这是换教师的决定性理由。
+- esophagus：两者都好（GIANT −0.84~−0.90 略优于 MONO −0.72~−0.85）。
+- **ureter：所有配置都不可靠**（MONO 下 3/5 为正或近零：+0.29/+0.26/+0.08）。
+
+**根因不是多视图位姿退化**——GIANT 逐帧与多视图同为 6/15，是 GIANT-nested 模型本身在 ercp 内容上失效。
+
+### 这对损失函数的意义
+
+符号反转正是 `s>0` 约束会**暴露**而非修复的情形：翻转的 clip 在 `s>0` 下根本对不齐；若放开 `s<0`，则会静默地教模型学反的几何。所以：
+
+1. **`corr(depth, 亮度)` 必须作为 per-clip QC 门控内建进伪标签流水线**，对 `corr > 0` 的 clip 直接拒绝或标记。
+2. **ureter 需要单独处置**：或排除出深度监督、或换内镜专用教师（Endo3R / EndoDAC）。不要假设它能用。
+
+### 跨帧尺度一致性（clip-wise 共享仿射的前提）
+
+MONO 逐帧推理下，一个 clip 内共享一组 $(s,b)$ 的残差是逐帧最优的 **1.29–2.33 倍**（esophagus 1.29–1.46、ercp 1.37–2.33、ureter 1.91）。可用，但有可测的漂移。注意这是**上界**——测法把真实场景变化也计入了残差。
+
+作为对比，GIANT 多视图模式的跨帧尺度非常稳（各帧范围都在 ~0.47–0.66），而 GIANT/MONO 逐帧模式下各帧范围乱跳（0.49–0.97）。若漂移成为问题，退路是滑窗多视图 + 跨窗尺度缝合。
+
+### 其他观察
+
+- `is_metric=1`，但深度范围只有 0.43–1.2。若当米解释，内镜场景应是毫米级——**该"metric"标注对我们无意义**，再次确认仿射不变损失是对的。
+- `conf` 图可用作损失权重 $w$，但它在**暗/远区域塌陷**——而那恰是管腔所在、深度最重要的地方。
+- DA3 内部把 270×360 重采样到 378×504。
+
+### P0 剩余项
+
+- RAFT 两版内镜对比（未做）
+- DualDPT head 权重加载 + 训练侧显存实测（未做）
+- **pixel frame ↔ latent timestep 真实映射**（未做，见 v2 变更清单 #18）
 
 ---
 
@@ -79,7 +136,7 @@ WAM4D 的 spatial register 本身就是一条**辅助 depth extraction path**：
 
 ### A. 离线伪标签
 
-**深度教师**：DA3（GIANT-1.1，与论文一致）。**运动教师**：RAFT（torchvision `raft_large` 已验证可用；`/mnt/data2/beilei/repository/StereoMIS-Dataset-in-Pytorch/RAFT` 为内镜域备选）。RAFT **只作 teacher**（见 #13）。
+**深度教师**：**`DA3MONO-LARGE`**（P0 实测后从论文的 GIANT-1.1 改过来，理由见 P0 章节）。几何头初始化应与之保持同源。**运动教师**：RAFT（torchvision `raft_large` 已验证可用；`/mnt/data2/beilei/repository/StereoMIS-Dataset-in-Pytorch/RAFT` 为内镜域备选）。RAFT **只作 teacher**（见 #13）。
 
 **存储格式（#8 修正）**——不用 H.264：
 

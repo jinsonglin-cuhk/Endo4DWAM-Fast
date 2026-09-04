@@ -76,7 +76,8 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
         latents_noisy = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
         if inputs["first_frame_latents"] is not None:
-            latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
+            n_hist = inputs["first_frame_latents"].shape[2]
+            latents_noisy[:, :, 0:n_hist] = inputs["first_frame_latents"]
 
         # Branch B: noisy action.
         noise_action = torch.randn_like(action)
@@ -108,7 +109,7 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
             latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
         if inputs["first_frame_latents"] is not None:
             latents_cond = latents_cond.clone()
-            latents_cond[:, :, 0:1] = inputs["first_frame_latents"]
+            latents_cond[:, :, 0:inputs["first_frame_latents"].shape[2]] = inputs["first_frame_latents"]
 
         video_pre_noisy = self.video_expert.pre_dit(
             x=latents_noisy,
@@ -190,16 +191,17 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
         pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre_noisy)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
+        num_dropped = 0
         if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+            num_dropped = inputs["first_frame_latents"].shape[2]
+            pred_video = pred_video[:, :, num_dropped:]
+            target_video = target_video[:, :, num_dropped:]
 
         loss_video_per_sample = self._compute_video_loss_per_sample(
             pred_video=pred_video,
             target_video=target_video,
             image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
+            num_dropped_latent_steps=num_dropped,
         )
         video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
             loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
@@ -345,6 +347,13 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        if self.num_history_latent_frames != 1:
+            raise NotImplementedError(
+                "Inference currently conditions on a single history frame, but the model was "
+                f"built with num_history_latent_frames={self.num_history_latent_frames}. "
+                "Training with K>1 and running inference with K=1 would be a train/test "
+                "mismatch, so this raises instead of silently producing it."
+            )
         latents_video[:, :, 0:1] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
@@ -395,6 +404,13 @@ class Endo4DWAMIDM(Endo4DWAMJoint):
                 fuse_vae_embedding_in_latents=fuse_flag,
             )
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
+            if self.num_history_latent_frames != 1:
+                raise NotImplementedError(
+                    "Inference currently conditions on a single history frame, but the model was "
+                    f"built with num_history_latent_frames={self.num_history_latent_frames}. "
+                    "Training with K>1 and running inference with K=1 would be a train/test "
+                    "mismatch, so this raises instead of silently producing it."
+                )
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         # Stage 2: freeze denoised video as cond and denoise action via video K/V cache.

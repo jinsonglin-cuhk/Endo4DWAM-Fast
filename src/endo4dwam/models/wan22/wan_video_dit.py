@@ -334,6 +334,7 @@ class WanVideoDiT(torch.nn.Module):
         action_dim: int = 7,
         action_group_causal_mask_mode = "causal",
         video_attention_mask_mode: str = "bidirectional",
+        num_history_latent_frames: int = 1,
         use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
@@ -348,6 +349,13 @@ class WanVideoDiT(torch.nn.Module):
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
         self.video_attention_mask_mode = str(video_attention_mask_mode)
+        # Number of leading latent frames treated as clean history. K=1 reproduces
+        # the original first-frame-only behaviour exactly.
+        self.num_history_latent_frames = int(num_history_latent_frames)
+        if self.num_history_latent_frames < 1:
+            raise ValueError(
+                f"`num_history_latent_frames` must be >= 1, got {self.num_history_latent_frames}"
+            )
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -498,10 +506,15 @@ class WanVideoDiT(torch.nn.Module):
                 video_tokens_per_frame, dim=1
             )
 
-        if self.video_attention_mask_mode == "first_frame_causal":
+        if self.video_attention_mask_mode in ("first_frame_causal", "first_k_frames_causal"):
+            # History = the first `num_history_latent_frames` latent frames. Those tokens
+            # may only attend among themselves; every future token sees everything.
+            # With K=1 this is identical to the original first-frame-only mask.
             video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-            video_mask[:first_frame_tokens, first_frame_tokens:] = False
+            history_tokens = min(
+                video_tokens_per_frame * self.num_history_latent_frames, video_seq_len
+            )
+            video_mask[:history_tokens, history_tokens:] = False
             return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")

@@ -340,7 +340,7 @@ class Endo4DWAM(torch.nn.Module):
         first_frame_latents = None
         fuse_flag = False
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
-            first_frame_latents = input_latents[:, :, 0:1]
+            first_frame_latents = input_latents[:, :, 0:self.num_history_latent_frames]
             fuse_flag = True
 
         if context.ndim != 3 or context_mask.ndim != 2:
@@ -382,6 +382,11 @@ class Endo4DWAM(torch.nn.Module):
             "image_is_pad": image_is_pad,
         }
 
+    @property
+    def num_history_latent_frames(self) -> int:
+        """Leading latent frames kept clean as history (1 = original behaviour)."""
+        return int(getattr(self.video_expert, "num_history_latent_frames", 1))
+
     @torch.no_grad()
     def _build_mot_attention_mask(
         self,
@@ -401,9 +406,11 @@ class Endo4DWAM(torch.nn.Module):
         )
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
-        # action -> first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        # action -> history video frames only (K=1 => original first-frame behaviour)
+        history_tokens = min(
+            video_tokens_per_frame * self.num_history_latent_frames, video_seq_len
+        )
+        mask[video_seq_len:, :history_tokens] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -411,7 +418,7 @@ class Endo4DWAM(torch.nn.Module):
         pred_video: torch.Tensor,
         target_video: torch.Tensor,
         image_is_pad: Optional[torch.Tensor],
-        include_initial_video_step: bool,
+        num_dropped_latent_steps: int = 0,
     ) -> torch.Tensor:
         video_loss_token = F.mse_loss(pred_video.float(), target_video.float(), reduction="none").mean(dim=(1, 3, 4))
         if image_is_pad is None:
@@ -428,12 +435,12 @@ class Endo4DWAM(torch.nn.Module):
                 f"num_frames={image_is_pad.shape[1]}, temporal_downsample_factor={temporal_factor}."
             )
 
+        # Measured pixel->latent grouping (P0): lat0 <- pix0 alone, lat_j (j>=1) <- pix[4j-3..4j].
         tail_is_pad = image_is_pad[:, 1:]
         latent_tail_is_pad = tail_is_pad.view(image_is_pad.shape[0], -1, temporal_factor).all(dim=2)
-        if include_initial_video_step:
-            video_is_pad = torch.cat([image_is_pad[:, :1], latent_tail_is_pad], dim=1)
-        else:
-            video_is_pad = latent_tail_is_pad
+        video_is_pad = torch.cat([image_is_pad[:, :1], latent_tail_is_pad], dim=1)
+        if num_dropped_latent_steps:
+            video_is_pad = video_is_pad[:, num_dropped_latent_steps:]
 
         if video_is_pad.shape[1] != video_loss_token.shape[1]:
             raise ValueError(
@@ -465,7 +472,8 @@ class Endo4DWAM(torch.nn.Module):
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
 
         if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+            n_hist = inputs["first_frame_latents"].shape[2]
+            latents[:, :, 0:n_hist] = inputs["first_frame_latents"]
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -531,16 +539,17 @@ class Endo4DWAM(torch.nn.Module):
 
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
+        num_dropped = 0
         if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+            num_dropped = inputs["first_frame_latents"].shape[2]
+            pred_video = pred_video[:, :, num_dropped:]
+            target_video = target_video[:, :, num_dropped:]
 
         loss_video_per_sample = self._compute_video_loss_per_sample(
             pred_video=pred_video,
             target_video=target_video,
             image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
+            num_dropped_latent_steps=num_dropped,
         )
         video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
             loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
@@ -819,6 +828,13 @@ class Endo4DWAM(torch.nn.Module):
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        if self.num_history_latent_frames != 1:
+            raise NotImplementedError(
+                "Inference currently conditions on a single history frame, but the model was "
+                f"built with num_history_latent_frames={self.num_history_latent_frames}. "
+                "Training with K>1 and running inference with K=1 would be a train/test "
+                "mismatch, so this raises instead of silently producing it."
+            )
         latents_video[:, :, 0:1] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
@@ -887,6 +903,13 @@ class Endo4DWAM(torch.nn.Module):
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            if self.num_history_latent_frames != 1:
+                raise NotImplementedError(
+                    "Inference currently conditions on a single history frame, but the model was "
+                    f"built with num_history_latent_frames={self.num_history_latent_frames}. "
+                    "Training with K>1 and running inference with K=1 would be a train/test "
+                    "mismatch, so this raises instead of silently producing it."
+                )
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)

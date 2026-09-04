@@ -28,6 +28,12 @@ video_dit_config:
   fuse_vae_embedding_in_latents: true
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   video_attention_mask_mode: "first_frame_causal" # default
+  # Leading latent frames kept clean as history. K=1 reproduces the original
+  # first-frame-only behaviour bit-for-bit. Measured pixel->latent grouping (P0):
+  # lat0 <- pix0 alone, lat_j (j>=1) <- pix[4j-3..4j], so K=2 == 5 history pixel
+  # frames and leaves 3 future latent steps out of 5.
+  # NOTE: inference still conditions on one frame, so K>1 raises there for now.
+  num_history_latent_frames: 1
   action_conditioned: false
   action_dim: ${data.train.processor.action_output_dim}
   action_group_causal_mask_mode: "group_diagonal"

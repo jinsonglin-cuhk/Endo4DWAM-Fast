@@ -31,7 +31,7 @@ video_dit_config:
   # Leading latent frames kept clean as history. K=1 reproduces the original
   # first-frame-only behaviour bit-for-bit. Measured pixel->latent grouping (P0):
   # lat0 <- pix0 alone, lat_j (j>=1) <- pix[4j-3..4j], so K=2 == 5 history pixel
-  # frames and leaves 3 future latent steps out of 5.
+  # frames. The standalone 17-frame default would leave 3 future latents.
   # NOTE: inference still conditions on one frame, so K>1 raises there for now.
   num_history_latent_frames: 1
   action_conditioned: false
@@ -62,12 +62,13 @@ action_scheduler:
 
 # Training-only geometry / motion readout (WAM4D-style spatial registers).
 # Removed entirely at inference; `enable: false` is bit-identical to no branch.
-# register_grid must equal the DiT token grid: video_size / 16 (VAE) / 2 (patch).
+# register_grid is the auxiliary DPT readout grid; grid * head.patch_size must
+# equal data.video_size. It is independent of the denser DiT video-token grid.
 # num_supervised_steps is the number of FUTURE latent steps = T_lat - K.
 geometry:
   enable: false
   capture_layers: [12, 14, 16, 18]   # WAM4D Table 7: middle layers won
-  geo_dim: 1024                      # == DA3 DPT dim_in, so no adapter is needed
+  geo_dim: 1024                      # EdGE readout adapts this to frame/global dim 2048
   num_heads: 8                       # 1024 / 8 = 128; the video expert's 24 does not divide 1024
   register_grid: [8, 10]             # 256x320 -> 8x10 cells of 32x32 px
   num_supervised_steps: 4            # T_lat 5 - K 1
@@ -76,14 +77,17 @@ geometry:
   motion:
     enable: true
   head:
-    model_id: depth-anything/DA3MONO-LARGE   # same source as the depth teacher
+    type: edge                               # IDM rejects geometry; kept for config parity
+    source_path: ${oc.env:EDGE_SRC,/mnt/data2/ljs/Endo4DWAM/EdGE-review}
+    weights_path: ${oc.env:EDGE_WEIGHTS,/mnt/data2/ljs/Endo4DWAM/EdGE-review/weights/model.safetensors}
+    model_id: depth-anything/DA3MONO-LARGE   # used only when type=da3
     patch_size: 32                           # 8x10 tokens -> 256x320
-    freeze: false                            # WAM4D Table 8: trainable pretrained won
+    freeze: false
 
 loss:
   lambda_action: 1.0
   # Geometry readout weights. Deliberately below WAM4D's lambda_depth=1: our depth is
-  # a domain-shifted DA3 pseudo-label, our flow a RAFT pseudo-label and our action a
+  # an EdGE pseudo-label, our flow a RAFT pseudo-label and our action a
   # pseudo-action, so the raw loss scales are not the paper's. Start small and watch
   # the gradient-norm ratio on the shared history features, not the loss values.
   lambda_depth: 0.0

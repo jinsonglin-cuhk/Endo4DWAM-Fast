@@ -1,0 +1,8 @@
+# @package _global_
+# Exact FastWAM mixed-attention path, no memory parameters.
+model:
+  training_attention_path: mixed
+  memory:
+    enable: false
+    action_read: false
+    geometry_read: false

@@ -1,0 +1,76 @@
+# @package _global_
+# EdGE depth + stride-2 RAFT motion distillation with five observed pixel frames.
+# Uses a 41-frame raw window so K=2 retains the baseline's 32-action horizon and
+# four future video latent steps; history length is no longer a horizon confound.
+defaults:
+  - override /data: endowam_endoscope
+  - override /model: endo4dwam
+  - _self_
+
+batch_size: 4
+num_workers: 8
+learning_rate: 1e-4
+lr_scheduler_type: cosine
+max_steps: 40000
+num_epochs: 10
+log_every: 10
+save_every: 1000
+eval_every: 500
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+save_total_limit: 1
+
+model:
+  mot_checkpoint_mixed_attn: true
+  training_attention_path: cached
+  action_to_video_grad_scale: 0.0
+  action_to_memory_grad_scale: 0.0
+  video_dit_config:
+    num_history_latent_frames: 2
+  geometry:
+    enable: true
+    num_supervised_steps: 4
+    depth:
+      enable: true
+      gradient_weight: 0.1
+    motion:
+      enable: true
+      include_observed: false
+      loss_type: charbonnier
+      charbonnier_epsilon: 1.0e-3
+      charbonnier_alpha: 0.5
+  memory:
+    enable: true
+    action_read: true
+    geometry_read: true
+    num_tokens: 64
+    dim: 1024
+    capture_layer: 18
+    num_heads: 8
+    num_blocks: 2
+  loss:
+    lambda_action: 1.0
+    lambda_depth: 0.05
+    lambda_flow: 0.05
+  lora:
+    enable: true
+
+data:
+  train:
+    num_frames: 41
+
+# S0 [0,2000): registers/readouts only.
+# S1 [2000,6000): add video LoRA, with pseudo-action -> video gradient detached.
+# S2 [6000,...): add action/proprio and admit a small pseudo-action gradient.
+curriculum:
+  enable: true
+  geometry_unfreeze_step: 0
+  head_unfreeze_step: 0
+  memory_unfreeze_step: 0
+  video_unfreeze_step: 2000
+  action_unfreeze_step: 6000
+  action_to_video_grad_scale_before: 0.0
+  action_to_video_grad_scale_after: 0.05
+  action_to_memory_grad_scale_before: 0.0
+  action_to_memory_grad_scale_after: 0.05

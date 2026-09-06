@@ -1,28 +1,13 @@
-"""Per-clip quality gate for the DA3 pseudo-depth labels.
+"""Heuristic quality gate for original-grid DA3 pseudo-depth labels.
 
-Endoscopy gives an objective check on depth *semantics*: illumination falls off
-with distance, so bright means near and a correct depth map must put larger
-depth values on darker pixels.
-
-Two statistics are computed, because the obvious one is misleading:
-
-  pearson   corr(depth, brightness) over all pixels. Must be negative. This is
-            what was used to catch DA3-GIANT inverting ercp, but it is NOT
-            comparable across procedures: its magnitude is attenuated by the
-            brightness contrast of the scene. Measured brightness std is 35.2
-            for esophagus, 27.2 for ureter and 17.8 for ercp, so the same depth
-            quality scores very differently.
-
-  decile    (median depth of the darkest 10% - median depth of the brightest
-            10%) / (p99 - p1 of depth). Positive means far pixels are dark, i.e.
-            correct. Only the two extremes are used and the result is divided by
-            the depth range, so it is far less sensitive to overall contrast and
-            is the statistic the gate should key on.
+Brightness/depth correlation and dark-vs-bright decile separation can identify
+suspicious labels, but reflectance, lighting, occlusion and exposure also affect
+these scores. They are not geometric ground truth or a calibrated cross-procedure
+quality scale. Inspect examples and calibrate thresholds before using the gate.
 
 Usage:
-    python scripts/qc_depth_sign.py --data_root <dataset root>
-    python scripts/qc_depth_sign.py --calibrate          # threshold sweep per procedure
-    python scripts/qc_depth_sign.py --out qc_depth.json  # per-episode records
+    python scripts/qc_depth_sign.py --data_root <dataset root> --out qc_depth.json
+    python scripts/qc_depth_sign.py --calibrate
 """
 from __future__ import annotations
 
@@ -32,6 +17,7 @@ from pathlib import Path
 
 import av
 import numpy as np
+from PIL import Image
 
 
 def brightness_like(frame_rgb: np.ndarray, shape_hw) -> np.ndarray:
@@ -48,6 +34,8 @@ def brightness_like(frame_rgb: np.ndarray, shape_hw) -> np.ndarray:
 def score_episode(depth_path: Path, video_path: Path, num_samples: int):
     depth = np.load(depth_path, mmap_mode="r")
     n = depth.shape[0]
+    if n == 0 or num_samples < 1:
+        raise ValueError("Depth must be nonempty and num_samples positive")
     idxs = sorted(set(np.linspace(0, n - 1, num_samples).astype(int).tolist()))
 
     container = av.open(str(video_path))
@@ -60,14 +48,25 @@ def score_episode(depth_path: Path, video_path: Path, num_samples: int):
                 break
     finally:
         container.close()
-    if not frames:
-        return None
+    if len(frames) != len(idxs):
+        raise ValueError(f"Video shorter than depth labels: {video_path}")
 
+    fov_path = depth_path.parent.parent / "fov_mask.png"
+    fov = np.asarray(Image.open(fov_path).convert("L")) > 0 if fov_path.exists() else None
     pearson, decile, contrast = [], [], []
     for i, rgb in frames.items():
         d = np.asarray(depth[i], dtype=np.float32)
+        if rgb.shape[:2] != d.shape:
+            raise ValueError(f"Depth QC requires original RGB grid: {depth_path}")
         g = brightness_like(rgb, d.shape)
-        dv, gv = d.ravel(), g.ravel()
+        valid = np.isfinite(d) & (g > 5) & (g < 250)
+        if fov is not None:
+            if fov.shape != d.shape:
+                raise ValueError(f"FOV mask shape mismatch: {fov_path}")
+            valid &= fov
+        dv, gv = d[valid], g[valid]
+        if dv.size < 100:
+            continue
         if dv.std() < 1e-8 or gv.std() < 1e-8:
             continue
         pearson.append(float(np.corrcoef(dv, gv)[0, 1]))
@@ -84,6 +83,7 @@ def score_episode(depth_path: Path, video_path: Path, num_samples: int):
     return {
         "episode": depth_path.stem,
         "num_frames": int(n),
+        "depth_mtime_ns": depth_path.stat().st_mtime_ns,
         "num_scored": len(pearson),
         "pearson": float(np.mean(pearson)),
         "decile": float(np.mean(decile)) if decile else float("nan"),
@@ -119,13 +119,16 @@ def main():
     records = []
     for proc_name, root in iter_roots(data_root, proc_filter):
         depth_dir = root / "geometry" / "depth"
-        video_dir = root / "videos" / "chunk-000" / "observation.images.endoscope"
+        info = json.loads((root / "meta/info.json").read_text())
         if not depth_dir.is_dir():
             continue
         for depth_path in sorted(depth_dir.glob("episode_*.npy")):
-            video_path = video_dir / f"{depth_path.stem}.mp4"
+            ep = int(depth_path.stem.split("_")[-1])
+            video_path = root / info["video_path"].format(
+                episode_chunk=ep // int(info.get("chunks_size", 1000)),
+                episode_index=ep, video_key="observation.images.endoscope")
             if not video_path.is_file():
-                continue
+                raise FileNotFoundError(video_path)
             rec = score_episode(depth_path, video_path, args.num_samples)
             if rec is None:
                 continue
@@ -138,8 +141,7 @@ def main():
                   f"{'PASS' if rec['passes'] else 'REJECT'}")
 
     if not records:
-        print(f"[ERR] no depth found under {data_root}. Generation may still be running.")
-        return
+        raise RuntimeError(f"No depth scored under {data_root}")
 
     print(f"\n{'procedure':12s} {'n':>4s} {'pearson':>9s} {'decile':>9s} {'bstd':>7s} {'pass':>9s}")
     procs = sorted({r["procedure"] for r in records})
@@ -161,9 +163,10 @@ def main():
                 k = sum(1 for r in rs if r["decile"] > th)
                 row += f"{k}/{len(rs)}".rjust(12)
             print(row)
-        print("\n  按术式选阈值时注意: pearson 跨术式不可比（被亮度对比度衰减），decile 才是可比的。")
+        print("\n  两项分数都是启发式；跨术式阈值需结合目视检查标定，不能直接解释为深度准确率。")
 
     if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(records, indent=2))
         print(f"\n写出 {len(records)} 条记录 -> {args.out}")
 

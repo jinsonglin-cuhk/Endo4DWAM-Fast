@@ -40,7 +40,11 @@ class Endo4DWAM(torch.nn.Module):
         loss_lambda_action: float = 1.0,
         loss_lambda_depth: float = 0.0,
         loss_lambda_flow: float = 0.0,
+        action_to_video_grad_scale: float = 1.0,
+        action_to_memory_grad_scale: float = 1.0,
+        training_attention_path: str = "mixed",
         geometry_config: Optional[dict] = None,
+        memory_config: Optional[dict] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -49,6 +53,7 @@ class Endo4DWAM(torch.nn.Module):
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
         self.dit = self.mot
         self.geometry_config = dict(geometry_config or {})
+        self.memory_config = dict(memory_config or {})
 
         self.vae = vae
         self.text_encoder = text_encoder
@@ -90,7 +95,17 @@ class Endo4DWAM(torch.nn.Module):
         self.loss_lambda_action = float(loss_lambda_action)
         self.loss_lambda_depth = float(loss_lambda_depth)
         self.loss_lambda_flow = float(loss_lambda_flow)
+        self.action_to_video_grad_scale = float(action_to_video_grad_scale)
+        self.action_to_memory_grad_scale = float(action_to_memory_grad_scale)
+        self.training_attention_path = str(training_attention_path).strip().lower()
+        if self.training_attention_path not in {"mixed", "cached"}:
+            raise ValueError("`training_attention_path` must be one of {'mixed', 'cached'}")
+        if not 0.0 <= self.action_to_video_grad_scale <= 1.0:
+            raise ValueError("`action_to_video_grad_scale` must be in [0, 1]")
+        if not 0.0 <= self.action_to_memory_grad_scale <= 1.0:
+            raise ValueError("`action_to_memory_grad_scale` must be in [0, 1]")
 
+        self._maybe_build_memory()
         self._maybe_build_geometry()
 
         self.to(self.device)
@@ -121,7 +136,11 @@ class Endo4DWAM(torch.nn.Module):
         loss_lambda_action: float = 1.0,
         loss_lambda_depth: float = 0.0,
         loss_lambda_flow: float = 0.0,
+        action_to_video_grad_scale: float = 1.0,
+        action_to_memory_grad_scale: float = 1.0,
+        training_attention_path: str = "mixed",
         geometry_config: Optional[dict] = None,
+        memory_config: Optional[dict] = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for Endo4DWAM.from_wan22_pretrained().")
@@ -181,7 +200,11 @@ class Endo4DWAM(torch.nn.Module):
             loss_lambda_action=loss_lambda_action,
             loss_lambda_depth=loss_lambda_depth,
             loss_lambda_flow=loss_lambda_flow,
+            action_to_video_grad_scale=action_to_video_grad_scale,
+            action_to_memory_grad_scale=action_to_memory_grad_scale,
+            training_attention_path=training_attention_path,
             geometry_config=geometry_config,
+            memory_config=memory_config,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -328,9 +351,11 @@ class Endo4DWAM(torch.nn.Module):
         if action.ndim != 3:
             raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
         action_horizon = int(action.shape[1])
-        if action_horizon % (num_frames - 1) != 0:
+        future_video_transitions = num_frames - self.num_history_pixel_frames
+        if future_video_transitions <= 0 or action_horizon % future_video_transitions != 0:
             raise ValueError(
-                f"`sample['action']` temporal dimension must be divisible by video transitions ({num_frames - 1}), got {action_horizon}"
+                "`sample['action']` temporal dimension must be divisible by future video "
+                f"transitions ({future_video_transitions}), got {action_horizon}"
             )
 
         action_is_pad = sample.get("action_is_pad", None)
@@ -421,6 +446,44 @@ class Endo4DWAM(torch.nn.Module):
         tf = int(self.vae.temporal_downsample_factor)
         return tf * (self.num_history_latent_frames - 1) + 1
 
+    def _maybe_build_memory(self) -> None:
+        """Attach persistent visual memory inside ``model.dit`` for training/save.
+
+        The module owns parameters but not rollout state. State is explicitly
+        passed through ``infer_action`` so episodes and concurrent environments
+        cannot contaminate one another.
+        """
+        cfg = self.memory_config
+        if not cfg or not cfg.get("enable", False):
+            return
+        capture_layer = int(cfg.get("capture_layer", 18))
+        if not 0 <= capture_layer < self.mot.num_layers:
+            raise ValueError(
+                f"`memory.capture_layer` must be in [0,{self.mot.num_layers - 1}], got {capture_layer}"
+            )
+        from .persistent_memory import build_persistent_memory
+
+        self.mot.world_memory = build_persistent_memory(
+            cfg,
+            video_dim=int(self.video_expert.hidden_dim),
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+
+    @property
+    def world_memory(self):
+        return getattr(self.mot, "world_memory", None)
+
+    def init_memory(self, batch_size: int = 1) -> Optional[torch.Tensor]:
+        """Return a reset state, or ``None`` when persistent memory is disabled."""
+        if self.world_memory is None:
+            return None
+        return self.world_memory.initial_state(
+            batch_size,
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+
     def _maybe_build_geometry(self) -> None:
         """Attach the training-only geometry readout, if enabled.
 
@@ -434,7 +497,6 @@ class Endo4DWAM(torch.nn.Module):
         if not cfg or not cfg.get("enable", False):
             return
         from .geometry_branch import build_geometry_branch
-        from .helpers.da3_head import build_da3_head
 
         grid = cfg.get("register_grid")
         if not grid:
@@ -447,27 +509,50 @@ class Endo4DWAM(torch.nn.Module):
         self.mot.geometry = build_geometry_branch(
             cfg, video_dim=int(self.video_expert.hidden_dim),
             num_spatial=num_spatial, num_time=num_time,
+            num_history=self.num_history_latent_frames,
+            memory_dim=(self.world_memory.dim if self.world_memory is not None else None),
             device=self.device, dtype=self.torch_dtype,
         )
         head_cfg = cfg.get("head", {})
         patch = int(head_cfg.get("patch_size", 32))
+        head_type = str(head_cfg.get("type", "da3")).lower()
+
+        def build_head(output_dim=None):
+            common = {
+                "patch_size": patch,
+                "output_dim": output_dim,
+                "device": self.device,
+                "dtype": self.torch_dtype,
+                "freeze": bool(head_cfg.get("freeze", False)),
+            }
+            if head_type == "edge":
+                from .helpers.edge_head import build_edge_head
+                return build_edge_head(
+                    head_cfg.get("weights_path", ""),
+                    source_path=head_cfg.get("source_path", ""),
+                    register_dim=int(cfg.get("geo_dim", 1024)),
+                    **common,
+                )
+            if head_type == "da3":
+                from .helpers.da3_head import build_da3_head
+                return build_da3_head(
+                    head_cfg.get("model_id", "depth-anything/DA3MONO-LARGE"),
+                    **common,
+                )
+            raise ValueError(f"Unknown geometry.head.type={head_type!r}; expected edge or da3")
+
         if self.mot.geometry.depth is not None:
-            head, _ = build_da3_head(head_cfg.get("model_id", "depth-anything/DA3MONO-LARGE"),
-                                     patch_size=patch, device=self.device, dtype=self.torch_dtype,
-                                     freeze=bool(head_cfg.get("freeze", False)))
+            head, _ = build_head()
             self.mot.geometry.depth_head = head
         if self.mot.geometry.motion is not None:
-            head, _ = build_da3_head(head_cfg.get("model_id", "depth-anything/DA3MONO-LARGE"),
-                                     patch_size=patch, output_dim=2, device=self.device,
-                                     dtype=self.torch_dtype,
-                                     freeze=bool(head_cfg.get("freeze", False)))
+            head, _ = build_head(output_dim=2)
             self.mot.geometry.motion_head = head
 
     @property
     def geometry(self):
         return getattr(self.mot, "geometry", None)
 
-    def _run_geometry(self, sample) -> bool:
+    def _run_geometry(self, sample, *, allow_eval: bool = False) -> bool:
         """Gate for the geometry branch.
 
         `self.mot.training`, NOT `self.training`: the trainer calls model.eval()
@@ -475,12 +560,19 @@ class Endo4DWAM(torch.nn.Module):
         training=False. Gating on self.training would silently disable the whole
         branch for an entire run without raising anything.
         """
-        return (
-            self.geometry is not None
-            and self.mot.training
-            and torch.is_grad_enabled()
-            and any(k in sample for k in ("depth", "flow"))
-        )
+        if self.geometry is None:
+            return False
+        if not allow_eval and (not self.mot.training or not torch.is_grad_enabled()):
+            return False
+        required = []
+        if self.geometry.depth is not None:
+            required += ["depth", "depth_mask"]
+        if self.geometry.motion is not None:
+            required += ["flow", "flow_mask"]
+        missing = [key for key in required if key not in sample]
+        if missing:
+            raise ValueError(f"Geometry enabled but sample is missing {missing}")
+        return True
 
     @torch.no_grad()
     def _build_mot_attention_mask(
@@ -547,7 +639,7 @@ class Endo4DWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
-    def training_loss(self, sample, tiled: bool = False):
+    def training_loss(self, sample, tiled: bool = False, geometry_eval: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -604,35 +696,87 @@ class Endo4DWAM(torch.nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
         )
-        run_geometry = self._run_geometry(sample)
+        run_geometry = self._run_geometry(sample, allow_eval=geometry_eval)
         geo_captures: dict[int, torch.Tensor] = {}
-        tokens_out = self.mot(
-            embeds_all={
-                "video": video_tokens,
-                "action": action_tokens,
-            },
-            attention_mask=attention_mask,
-            freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
-            },
-            context_all={
-                "video": {
+        memory_state = None
+        use_cached_training = (
+            self.training_attention_path == "cached" or self.world_memory is not None
+        )
+        if use_cached_training:
+            memory_layer = None
+            capture_layers = set(self.geometry.capture_layers if run_geometry else ())
+            if self.world_memory is not None:
+                memory_layer = int(self.memory_config.get("capture_layer", 18))
+                capture_layers.add(memory_layer)
+            video_kv_cache, final_video_tokens = self.mot.prefill_video_cache(
+                video_tokens=video_tokens,
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
                     "context": video_pre["context"],
                     "mask": video_pre["context_mask"],
                 },
-                "action": {
+                video_attention_mask=attention_mask[:video_tokens.shape[1], :video_tokens.shape[1]],
+                capture_layers=sorted(capture_layers),
+                capture_out=geo_captures,
+                return_final_tokens=True,
+            )
+            if self.world_memory is not None:
+                tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+                history_tokens = tokens_per_frame * self.num_history_latent_frames
+                memory_state = self.world_memory.update(
+                    geo_captures[memory_layer][:, :history_tokens],
+                    tokens_per_frame=tokens_per_frame,
+                    state=sample.get("memory_state"),
+                    detach_previous=True,
+                )
+            action_memory_state = memory_state \
+                if bool(self.memory_config.get("action_read", True)) else None
+            final_action_tokens = self.mot.forward_action_with_video_cache(
+                action_tokens=action_tokens,
+                action_freqs=action_pre["freqs"],
+                action_t_mod=action_pre["t_mod"],
+                action_context_payload={
                     "context": action_pre["context"],
                     "mask": action_pre["context_mask"],
                 },
-            },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
-            },
-            capture_layers=self.geometry.capture_layers if run_geometry else None,
-            capture_out=geo_captures if run_geometry else None,
-        )
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_tokens.shape[1],
+                memory_state=action_memory_state,
+                action_to_video_grad_scale=self.action_to_video_grad_scale,
+                action_to_memory_grad_scale=self.action_to_memory_grad_scale,
+            )
+            tokens_out = {"video": final_video_tokens, "action": final_action_tokens}
+        else:
+            tokens_out = self.mot(
+                embeds_all={
+                    "video": video_tokens,
+                    "action": action_tokens,
+                },
+                attention_mask=attention_mask,
+                freqs_all={
+                    "video": video_pre["freqs"],
+                    "action": action_pre["freqs"],
+                },
+                context_all={
+                    "video": {
+                        "context": video_pre["context"],
+                        "mask": video_pre["context_mask"],
+                    },
+                    "action": {
+                        "context": action_pre["context"],
+                        "mask": action_pre["context_mask"],
+                    },
+                },
+                t_mod_all={
+                    "video": video_pre["t_mod"],
+                    "action": action_pre["t_mod"],
+                },
+                capture_layers=self.geometry.capture_layers if run_geometry else None,
+                capture_out=geo_captures if run_geometry else None,
+                action_to_video_grad_scale=self.action_to_video_grad_scale,
+            )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
 
@@ -674,8 +818,12 @@ class Endo4DWAM(torch.nn.Module):
         # when the branch is off. trainer.py builds a tensor per key and all-gathers
         # it; if one rank omitted a key the ranks would disagree on the key set and
         # the collective would deadlock.
-        loss_depth, loss_flow = self._geometry_losses(sample, geo_captures, video_pre) \
-            if run_geometry else (None, None)
+        geometry_memory_state = memory_state \
+            if bool(self.memory_config.get("geometry_read", True)) else None
+        loss_depth, loss_flow, geometry_metrics = self._geometry_losses(
+            sample, geo_captures, video_pre, memory_state=geometry_memory_state
+        ) \
+            if run_geometry else (None, None, {})
         if loss_depth is not None:
             loss_total = loss_total + self.loss_lambda_depth * loss_depth
         if loss_flow is not None:
@@ -686,48 +834,91 @@ class Endo4DWAM(torch.nn.Module):
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             "loss_depth": self.loss_lambda_depth * float(loss_depth.detach().item()) if loss_depth is not None else 0.0,
             "loss_flow": self.loss_lambda_flow * float(loss_flow.detach().item()) if loss_flow is not None else 0.0,
+            "depth_abs_rel": float(geometry_metrics.get("depth_abs_rel", 0.0)),
+            "depth_rmse": float(geometry_metrics.get("depth_rmse", 0.0)),
+            "flow_epe": float(geometry_metrics.get("flow_epe", 0.0)),
+            "memory_norm": float(memory_state.detach().float().norm(dim=-1).mean().item())
+                if memory_state is not None else 0.0,
         }
         return loss_total, loss_dict
 
-    def _geometry_losses(self, sample, captures, video_pre):
-        """Depth / motion readout losses. Returns (loss_depth | None, loss_flow | None)."""
+    def _geometry_losses(self, sample, captures, video_pre, memory_state=None):
+        """Depth/motion readout losses plus aligned depth and flow validation metrics."""
         from .geometry_losses import clip_shared_affine_depth_loss, flow_loss
 
         branch = self.geometry
         tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
         history_tokens = tokens_per_frame * self.num_history_latent_frames
         history = branch.history_slices(captures, history_tokens)
+        if self.geometry_config.get("detach_history", False):
+            history = [value.detach() for value in history]
         grid = self.geometry_config["register_grid"]
         gh, gw = int(grid[0]), int(grid[1])
 
         def decode(stack, head, levels_owner):
-            levels = stack(history)
+            levels = stack(history, memory=memory_state)
             feats = [[lvl] for lvl in levels]
             b, s = levels[0].shape[0], levels[0].shape[1]
             out = head(feats, H=gh * head.patch_size, W=gw * head.patch_size, patch_start_idx=0)
             return out, b, s
 
         loss_depth = None
+        metrics = {}
         if branch.depth is not None and "depth" in sample:
             out, _, _ = decode(branch.depth, branch.depth_head, "depth")
             pred = out["depth"]
             target = sample["depth"].to(device=pred.device, dtype=pred.dtype)
             weight = sample.get("depth_mask")
             weight = None if weight is None else weight.to(device=pred.device, dtype=pred.dtype)
-            loss_depth, _, _ = clip_shared_affine_depth_loss(pred, target, weight)
+            sample_weight = sample.get("depth_weight")
+            if sample_weight is not None:
+                sample_weight = sample_weight.to(device=pred.device)
+            loss_depth, scale, shift = clip_shared_affine_depth_loss(
+                pred,
+                target,
+                weight,
+                sample_weight=sample_weight,
+                gradient_weight=float(
+                    self.geometry_config.get("depth", {}).get("gradient_weight", 0.0)
+                ),
+            )
+            aligned = scale[:, None, None, None] * pred.float() + shift[:, None, None, None]
+            valid = torch.ones_like(target, dtype=torch.float32) if weight is None else weight.float()
+            denom = valid.sum().clamp(min=1.0)
+            error = aligned - target.float()
+            metrics["depth_abs_rel"] = (
+                error.abs() / target.float().abs().clamp(min=1e-3) * valid
+            ).sum().div(denom).detach().item()
+            metrics["depth_rmse"] = (
+                error.square().mul(valid).sum().div(denom).sqrt().detach().item()
+            )
 
         loss_flow = None
         if branch.motion is not None and "flow" in sample:
             out, _, _ = decode(branch.motion, branch.motion_head, "motion")
             pred = out["depth"]                       # DPT names its main output "depth"
-            if pred.dim() == 4:                       # [B,S,H,W] -> [B,S,1,H,W]
-                pred = pred.unsqueeze(2)
+            # DPT multi-channel output is [B,S,H,W,C] (last logit is confidence).
+            if pred.ndim != 5 or pred.shape[-1] != 2:
+                raise ValueError(f"Motion DPT must return two signed channels, got {pred.shape}")
+            pred = pred.permute(0, 1, 4, 2, 3).contiguous()
             target = sample["flow"].to(device=pred.device, dtype=pred.dtype)
             mask = sample.get("flow_mask")
             mask = None if mask is None else mask.to(device=pred.device, dtype=pred.dtype)
-            loss_flow = flow_loss(pred, target, mask)
+            flow_cfg = self.geometry_config.get("motion", {})
+            loss_flow = flow_loss(
+                pred,
+                target,
+                mask,
+                loss_type=str(flow_cfg.get("loss_type", "charbonnier")),
+                beta=float(flow_cfg.get("smooth_l1_beta", 0.05)),
+                epsilon=float(flow_cfg.get("charbonnier_epsilon", 1e-3)),
+                alpha=float(flow_cfg.get("charbonnier_alpha", 0.5)),
+            )
+            valid = torch.ones_like(target[:, :, 0], dtype=torch.float32) if mask is None else mask.float()
+            epe = (pred.float() - target.float()).square().sum(dim=2).sqrt()
+            metrics["flow_epe"] = (epe * valid).sum().div(valid.sum().clamp(min=1.0)).detach().item()
 
-        return loss_depth, loss_flow
+        return loss_depth, loss_flow, metrics
 
     @torch.no_grad()
     def _predict_joint_noise(
@@ -863,6 +1054,7 @@ class Endo4DWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        memory_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -881,6 +1073,7 @@ class Endo4DWAM(torch.nn.Module):
             video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
+            memory_state=memory_state,
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
 
@@ -903,12 +1096,14 @@ class Endo4DWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
+        memory_state: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
+        next_memory_state = None
         if test_action_with_infer_action:
             if seed is None:
                 raise ValueError("`test_action_with_infer_action=True` requires non-null `seed`.")
-            action_only_out = self.infer_action(
+            action_only_result = self.infer_action(
                 prompt=prompt,
                 input_image=input_image.clone(),
                 action_horizon=action_horizon,
@@ -920,13 +1115,18 @@ class Endo4DWAM(torch.nn.Module):
                 rand_device=rand_device,
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
-            )["action"]
+                memory_state=memory_state,
+            )
+            action_only_out = action_only_result["action"]
+            next_memory_state = action_only_result.get("memory_state")
         
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if (input_image.ndim != 4 or input_image.shape[0] != self.num_history_pixel_frames
+                or input_image.shape[1] != 3):
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must contain {self.num_history_pixel_frames} history frames "
+                f"as [N,3,H,W], got {tuple(input_image.shape)}"
             )
         _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
@@ -1052,7 +1252,12 @@ class Endo4DWAM(torch.nn.Module):
             latents_video[:, :, 0:self.num_history_latent_frames] = first_frame_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
-        if test_action_with_infer_action:
+        if test_action_with_infer_action and self.world_memory is not None:
+            # The joint denoising branch is intentionally retained as the
+            # future-video ablation and has no memory K/V. Return the reference
+            # cached-policy action while keeping its generated video.
+            action_out = action_only_out
+        elif test_action_with_infer_action:
             if not torch.allclose(action_out, action_only_out, atol=1e-2, rtol=1e-2):
                 max_abs_diff = (action_out - action_only_out).abs().max().item()
                 logger.warning(
@@ -1062,6 +1267,7 @@ class Endo4DWAM(torch.nn.Module):
         return {
             "video": self._decode_latents(latents_video, tiled=tiled),
             "action": action_out,
+            "memory_state": next_memory_state,
         }
 
     @torch.no_grad()
@@ -1080,18 +1286,24 @@ class Endo4DWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        memory_state: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
-        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+        attention_mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+        if attention_mode not in {"first_frame_causal", "first_k_frames_causal"}:
             raise ValueError(
-                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
+                "`infer_action` requires causal history attention: "
+                "video_attention_mask_mode must be 'first_frame_causal' or "
+                "'first_k_frames_causal'."
             )
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if (input_image.ndim != 4 or input_image.shape[0] != self.num_history_pixel_frames
+                or input_image.shape[1] != 3):
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must contain {self.num_history_pixel_frames} history frames "
+                f"as [N,3,H,W], got {tuple(input_image.shape)}"
             )
         _, _, height, width = input_image.shape
         if height % 16 != 0 or width % 16 != 0:
@@ -1172,6 +1384,10 @@ class Endo4DWAM(torch.nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
         )
+        memory_captures: dict[int, torch.Tensor] = {}
+        memory_capture_layers = None
+        if self.world_memory is not None:
+            memory_capture_layers = [int(self.memory_config.get("capture_layer", 18))]
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
             video_freqs=video_pre["freqs"],
@@ -1181,7 +1397,20 @@ class Endo4DWAM(torch.nn.Module):
                 "mask": video_pre["context_mask"],
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            capture_layers=memory_capture_layers,
+            capture_out=memory_captures if memory_capture_layers else None,
         )
+        next_memory_state = None
+        if self.world_memory is not None:
+            memory_layer = memory_capture_layers[0]
+            next_memory_state = self.world_memory.update(
+                memory_captures[memory_layer],
+                tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                state=memory_state,
+                detach_previous=True,
+            )
+        elif memory_state is not None:
+            raise ValueError("`memory_state` was provided but persistent memory is disabled")
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1192,6 +1421,8 @@ class Endo4DWAM(torch.nn.Module):
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
+            action_memory_state = next_memory_state \
+                if bool(self.memory_config.get("action_read", True)) else None
             pred_action_posi = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
@@ -1200,6 +1431,7 @@ class Endo4DWAM(torch.nn.Module):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                memory_state=action_memory_state,
             )
             pred_action = pred_action_posi
 
@@ -1207,6 +1439,7 @@ class Endo4DWAM(torch.nn.Module):
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "memory_state": None if next_memory_state is None else next_memory_state.detach(),
         }
 
     @torch.no_grad()
@@ -1228,6 +1461,7 @@ class Endo4DWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        memory_state: Optional[torch.Tensor] = None,
     ):
         return self.infer_joint(
             prompt=prompt,
@@ -1245,6 +1479,7 @@ class Endo4DWAM(torch.nn.Module):
             seed=seed,
             rand_device=rand_device,
             tiled=tiled,
+            memory_state=memory_state,
         )
 
     def save_checkpoint(self, path, optimizer=None, step=None):

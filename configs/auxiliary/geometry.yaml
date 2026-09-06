@@ -1,0 +1,19 @@
+# @package _global_
+# Depth + flow training-only distillation. Compatible with both history=k1 and
+# history=k2 because both controls retain four future latent prediction steps.
+model:
+  geometry:
+    enable: true
+    detach_history: false
+    depth:
+      enable: true
+      gradient_weight: 0.1
+    motion:
+      enable: true
+      include_observed: false
+      loss_type: charbonnier
+      charbonnier_epsilon: 1.0e-3
+      charbonnier_alpha: 0.5
+  loss:
+    lambda_depth: 0.05
+    lambda_flow: 0.05

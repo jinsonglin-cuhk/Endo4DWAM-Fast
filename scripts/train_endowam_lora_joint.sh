@@ -15,12 +15,16 @@
 #   2. python scripts/precompute_text_embeds.py task=endowam_joint_1cam_1e-4
 
 set -euo pipefail
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # ============================================================================
 # GPU / process configuration
 # ============================================================================
-export CUDA_VISIBLE_DEVICES=6,7
-NPROC_PER_NODE=2
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 # ============================================================================
 # Run identity  (fixed so that --resume can locate the checkpoint dir)
@@ -28,8 +32,8 @@ NPROC_PER_NODE=2
 # changed to endowam_pseudo_z60 (3 roots, no rot augmentation), so the old
 # checkpoints are not resumable against this data anyway.
 # ============================================================================
-RUN_ROOT=./runs/endowam_joint_lora
-RUN_ID=endo4dwam_joint_lora_z60
+RUN_ROOT="${RUN_ROOT:-./runs/endowam_joint_lora}"
+RUN_ID="${RUN_ID:-endo4dwam_joint_lora_z60_crop_split}"
 
 # ============================================================================
 # LoRA configuration  (matches EndoWAM defaults)
@@ -69,28 +73,33 @@ OUTPUT_DIR="${RUN_ROOT}/${RUN_ID}"
 RESUME=null
 
 if [[ "${1:-}" == "--resume" ]]; then
+    shift
     state_root="${OUTPUT_DIR}/checkpoints/state"
-    if [[ -d "${state_root}" ]]; then
-        latest_state=$(ls "${state_root}" 2>/dev/null \
-            | grep -E '^step_[0-9]+$' \
-            | sort -t_ -k2 -n \
-            | tail -1)
-        if [[ -n "${latest_state}" ]]; then
-            RESUME="${state_root}/${latest_state}"
-            echo "[INFO] Resuming from: ${RESUME}"
-        else
-            echo "[WARN] --resume passed but no state checkpoint found in ${state_root}; starting fresh."
+    latest_step=-1
+    for candidate in "${state_root}"/step_*; do
+        [[ -d "$candidate" && -f "$candidate/trainer_state.json" ]] || continue
+        step="${candidate##*/step_}"
+        [[ "$step" =~ ^[0-9]+$ ]] || continue
+        if (( 10#$step > latest_step )); then
+            latest_step=$((10#$step))
+            RESUME="$candidate"
         fi
-    else
-        echo "[WARN] --resume passed but checkpoint state dir ${state_root} does not exist; starting fresh."
+    done
+    if [[ "$RESUME" == null ]]; then
+        echo "[ERROR] No complete training state in ${state_root}; refusing to start fresh with --resume." >&2
+        exit 1
     fi
+fi
+if [[ "$RESUME" == null && -f "${OUTPUT_DIR}/config.yaml" ]]; then
+    echo "[ERROR] Run already exists: ${OUTPUT_DIR}. Use --resume or a new RUN_ID." >&2
+    exit 1
 fi
 
 # ============================================================================
 # Setup
 # ============================================================================
 mkdir -p "${OUTPUT_DIR}"
-cp "$0" "${OUTPUT_DIR}/"   # archive the launch script alongside the run
+cp "$SCRIPT_PATH" "${OUTPUT_DIR}/"   # archive the launch script alongside the run
 
 echo "[launch] task=endowam_joint_1cam_1e-4 nproc=${NPROC_PER_NODE} output_dir=${OUTPUT_DIR} resume=${RESUME}"
 
@@ -123,4 +132,5 @@ accelerate launch \
     "save_total_limit=${SAVE_TOTAL_LIMIT}" \
     "eval_every=${EVAL_EVERY}" \
     "eval_num_inference_steps=${EVAL_INFERENCE_STEPS}" \
-    "resume=${RESUME}"
+    "resume=${RESUME}" \
+    "$@"

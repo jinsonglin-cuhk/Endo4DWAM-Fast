@@ -114,9 +114,11 @@ class Endo4DWAMJoint(Endo4DWAM):
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if (input_image.ndim != 4 or input_image.shape[0] != self.num_history_pixel_frames
+                or input_image.shape[1] != 3):
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must contain {self.num_history_pixel_frames} history frames "
+                f"as [N,3,H,W], got {tuple(input_image.shape)}"
             )
         _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)

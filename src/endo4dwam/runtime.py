@@ -40,6 +40,125 @@ def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
     return torch.bfloat16
 
 
+def _validate_pipeline_config(cfg: DictConfig) -> None:
+    """Fail cheap configuration errors before loading data or the 5B model."""
+    model_cfg = cfg.model
+    data_cfg = cfg.data.train
+    video_cfg = model_cfg.video_dit_config
+    geometry_cfg = model_cfg.get("geometry") or {}
+    memory_cfg = model_cfg.get("memory") or {}
+
+    history = int(video_cfg.num_history_latent_frames)
+    data_history = int(data_cfg.num_history_latent_frames)
+    if history < 1 or data_history != history:
+        raise ValueError(
+            "Model and dataset num_history_latent_frames must match and be >= 1, "
+            f"got model={history}, data={data_history}"
+        )
+
+    training_attention_path = str(model_cfg.get("training_attention_path", "mixed"))
+    if training_attention_path not in {"mixed", "cached"}:
+        raise ValueError("model.training_attention_path must be one of: mixed, cached")
+
+    num_layers = int(video_cfg.num_layers)
+    if geometry_cfg.get("enable", False):
+        supported = {
+            "endo4dwam.runtime.create_endo4dwam",
+            "endo4dwam.runtime.create_endo4dwam_joint",
+        }
+        if str(model_cfg._target_) not in supported:
+            raise ValueError("Geometry pipeline supports Endo4DWAM base/joint, not IDM")
+        for branch, loss_name in (("depth", "lambda_depth"), ("motion", "lambda_flow")):
+            branch_cfg = geometry_cfg.get(branch) or {}
+            if branch_cfg.get("enable", False) and float(model_cfg.loss[loss_name]) <= 0:
+                raise ValueError(f"Enabled geometry branch requires positive {loss_name}")
+        if not (data_cfg.get("geometry") or {}).get("enable", False):
+            raise ValueError("Geometry model requires an enabled geometry dataloader")
+
+        capture_layers = [int(value) for value in geometry_cfg.get("capture_layers", ())]
+        if not capture_layers:
+            raise ValueError("geometry.capture_layers must contain at least one layer")
+        if len(capture_layers) != 4:
+            raise ValueError("geometry DPT readout requires exactly four capture_layers")
+        if len(set(capture_layers)) != len(capture_layers):
+            raise ValueError("geometry.capture_layers must be unique")
+        invalid_layers = [value for value in capture_layers if not 0 <= value < num_layers]
+        if invalid_layers:
+            raise ValueError(
+                f"geometry.capture_layers must be in [0,{num_layers - 1}], got {invalid_layers}"
+            )
+
+        geo_dim = int(geometry_cfg.get("geo_dim", 1024))
+        geo_heads = int(geometry_cfg.get("num_heads", 8))
+        if geo_heads <= 0 or geo_dim % geo_heads:
+            raise ValueError("geometry.geo_dim must be divisible by geometry.num_heads")
+
+        grid = list(geometry_cfg.get("register_grid") or ())
+        if len(grid) != 2 or any(int(value) <= 0 for value in grid):
+            raise ValueError("geometry.register_grid must contain two positive integers")
+        head_cfg = geometry_cfg.get("head") or {}
+        head_type = str(head_cfg.get("type", "da3")).lower()
+        if head_type not in {"edge", "da3"}:
+            raise ValueError("geometry.head.type must be one of: edge, da3")
+        if head_type == "edge" and not Path(str(head_cfg.get("weights_path", ""))).is_file():
+            raise FileNotFoundError(
+                f"EdGE head weights not found: {head_cfg.get('weights_path', '')}"
+            )
+        if head_type == "edge":
+            edge_source = Path(str(head_cfg.get("source_path", "")))
+            if not (edge_source / "edge/models/components/heads/dpt_head.py").is_file():
+                raise FileNotFoundError(f"EdGE source tree not found: {edge_source}")
+        patch_size = int(head_cfg.get("patch_size", 32))
+        video_size = [int(value) for value in data_cfg.video_size]
+        output_size = [int(grid[0]) * patch_size, int(grid[1]) * patch_size]
+        if output_size != video_size:
+            raise ValueError(
+                "geometry.register_grid * geometry.head.patch_size must equal data video_size, "
+                f"got {output_size} and {video_size}"
+            )
+
+        ratio = int(data_cfg.action_video_freq_ratio)
+        num_frames = int(data_cfg.num_frames)
+        sampled_video_frames = (num_frames - 1) // ratio + 1
+        temporal_factor = int(data_cfg.vae_temporal_downsample_factor)
+        latent_steps = (sampled_video_frames - 1) // temporal_factor + 1
+        expected_steps = latent_steps - history
+        configured_steps = int(geometry_cfg.get("num_supervised_steps", 0))
+        if expected_steps <= 0 or configured_steps != expected_steps:
+            raise ValueError(
+                "geometry.num_supervised_steps must equal T_latent - K > 0, "
+                f"got configured={configured_steps}, expected={expected_steps}"
+            )
+
+    if memory_cfg.get("enable", False):
+        if str(model_cfg._target_) != "endo4dwam.runtime.create_endo4dwam":
+            raise ValueError("Persistent memory is implemented only for the base Endo4DWAM reference policy")
+        if str(video_cfg.video_attention_mask_mode) not in {
+            "first_frame_causal", "first_k_frames_causal"
+        }:
+            raise ValueError("Persistent memory requires causal history-video attention")
+        if training_attention_path != "cached":
+            raise ValueError("Persistent memory requires model.training_attention_path=cached")
+        action_reads = bool(memory_cfg.get("action_read", True))
+        geometry_reads = bool(memory_cfg.get("geometry_read", True)) and bool(
+            geometry_cfg.get("enable", False)
+        )
+        if not action_reads and not geometry_reads:
+            raise ValueError(
+                "Persistent memory has no supervised consumer: enable memory.action_read "
+                "or enable geometry together with memory.geometry_read"
+            )
+        capture_layer = int(memory_cfg.get("capture_layer", 18))
+        if not 0 <= capture_layer < num_layers:
+            raise ValueError(
+                f"memory.capture_layer must be in [0,{num_layers - 1}], got {capture_layer}"
+            )
+        memory_dim = int(memory_cfg.get("dim", 1024))
+        memory_heads = int(memory_cfg.get("num_heads", 8))
+        if memory_heads <= 0 or memory_dim % memory_heads:
+            raise ValueError("memory.dim must be divisible by memory.num_heads")
+
+
 def _apply_lora_to_video_expert(model, lora_cfg) -> None:
     """Inject PEFT LoRA into the video expert (WanVideoDiT) in-place.
 
@@ -174,6 +293,10 @@ def create_endo4dwam(
     action_scheduler=None,
     loss=None,
     geometry=None,
+    memory=None,
+    action_to_video_grad_scale: float = 1.0,
+    action_to_memory_grad_scale: float = 1.0,
+    training_attention_path: str = "mixed",
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -221,6 +344,12 @@ def create_endo4dwam(
         geometry = {}
     if not isinstance(geometry, dict):
         raise ValueError(f"`geometry` must resolve to a dict, got {type(geometry)}")
+    if isinstance(memory, DictConfig):
+        memory = OmegaConf.to_container(memory, resolve=True)
+    if memory is None:
+        memory = {}
+    if not isinstance(memory, dict):
+        raise ValueError(f"`memory` must resolve to a dict, got {type(memory)}")
     if isinstance(loss, DictConfig):
         loss = OmegaConf.to_container(loss, resolve=True)
     if loss is None:
@@ -252,7 +381,11 @@ def create_endo4dwam(
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         loss_lambda_depth=float(loss.get("lambda_depth", 0.0)),
         loss_lambda_flow=float(loss.get("lambda_flow", 0.0)),
+        action_to_video_grad_scale=float(action_to_video_grad_scale),
+        action_to_memory_grad_scale=float(action_to_memory_grad_scale),
+        training_attention_path=str(training_attention_path),
         geometry_config=geometry,
+        memory_config=memory,
     )
     if lora is not None:
         _apply_lora_to_video_expert(model, lora)
@@ -273,6 +406,7 @@ def create_endo4dwam_joint(
     action_scheduler=None,
     loss=None,
     geometry=None,
+    action_to_video_grad_scale: float = 1.0,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -351,6 +485,7 @@ def create_endo4dwam_joint(
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         loss_lambda_depth=float(loss.get("lambda_depth", 0.0)),
         loss_lambda_flow=float(loss.get("lambda_flow", 0.0)),
+        action_to_video_grad_scale=float(action_to_video_grad_scale),
         geometry_config=geometry,
     )
     if lora is not None:
@@ -492,14 +627,28 @@ def run_training(cfg: DictConfig):
     )
     misc.register_work_dir(cfg.output_dir)
     config_payload = OmegaConf.to_container(cfg, resolve=True)
-    with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
-        OmegaConf.save(config_payload, f)
+    if cfg.resume and Path(str(cfg.resume)).is_dir():
+        old_path = Path(str(cfg.resume)).resolve().parents[2] / "config.yaml"
+        if old_path.is_file():
+            old_cfg = OmegaConf.load(old_path)
+            for key in ("model", "data"):
+                if OmegaConf.to_container(old_cfg[key], resolve=True) != config_payload[key]:
+                    raise ValueError(f"Full resume requires unchanged {key} config. Use a weights .pt warm start and a new output_dir.")
+    _validate_pipeline_config(cfg)
+    config_path = Path(cfg.output_dir) / "config.yaml"
+    if int(os.environ.get("RANK", "0")) == 0 and not cfg.resume and config_path.exists():
+        raise FileExistsError(f"Run already exists: {config_path.parent}; use a new output_dir")
 
     model_device = _resolve_train_device()
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
-    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    # Validate label metadata and dataset setup before allocating the 5B model.
     train_ds, val_ds = build_datasets(cfg.data)
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    if int(os.environ.get("RANK", "0")) == 0:
+        temporary = config_path.with_suffix(".yaml.tmp")
+        OmegaConf.save(config_payload, temporary)
+        temporary.replace(config_path)
 
     trainer = Wan22Trainer(
         cfg=cfg,

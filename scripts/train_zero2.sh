@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 NPROC_PER_NODE="${1:?Usage: bash scripts/train.sh <nproc_per_node> [hydra_overrides...]}"
 shift
@@ -14,8 +17,13 @@ is_integer() {
   [[ "${1}" =~ ^[0-9]+$ ]]
 }
 
-if ! is_integer "${NUM_MACHINES}" || ! is_integer "${MACHINE_RANK}"; then
+if ! is_integer "${NPROC_PER_NODE}" || ! is_integer "${NUM_MACHINES}" || ! is_integer "${MACHINE_RANK}"; then
   echo "Error: NUM_MACHINES (${NUM_MACHINES}) and MACHINE_RANK (${MACHINE_RANK}) must be integers." >&2
+  exit 1
+fi
+
+if (( NPROC_PER_NODE < 1 || NUM_MACHINES < 1 || MACHINE_RANK >= NUM_MACHINES )); then
+  echo "Error: invalid process count or machine rank." >&2
   exit 1
 fi
 
@@ -97,6 +105,9 @@ if machine_rank == 0:
     run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     store.set(key, run_id)
 run_id = store.get(key).decode("utf-8")
+store.set(f"ack::{machine_rank}", "1")
+if machine_rank == 0:
+    store.wait([f"ack::{i}" for i in range(num_machines)])
 print(run_id)
 PY
     )"
@@ -109,7 +120,12 @@ echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} mac
 
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero2_ds.yaml \
-  --num_processes "${NPROC_PER_NODE}" \
+  --num_processes "$((NPROC_PER_NODE * NUM_MACHINES))" \
+  --num_machines "${NUM_MACHINES}" \
+  --machine_rank "${MACHINE_RANK}" \
+  --main_process_ip "${MAIN_PROCESS_IP}" \
+  --main_process_port "${MAIN_PROCESS_PORT}" \
+  --deepspeed_multinode_launcher standard \
   scripts/train.py \
   "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
   "wandb.name=${TASK_BASENAME}" \

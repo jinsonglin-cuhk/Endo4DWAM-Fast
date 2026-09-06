@@ -1,5 +1,8 @@
 # Endo4DWAM-Fast
 
+
+> 2026-09-05 pipeline 已修复：等比裁剪、episode 留出验证、严格几何标签校验及训练快照评估。当前命令与限制见 [训练说明](scripts/TRAINING.md)。
+
 面向**内镜**的视频 + 动作世界模型 baseline，基于
 [FastWAM](https://github.com/yuantianyuan01/FastWAM)（Wan2.2-TI2V-5B 视频 DiT + ActionDiT，
 联合 flow matching 训练）改造，适配 EndoWAM 内镜数据集。
@@ -63,7 +66,8 @@ Endo4DWAM-Fast/
 │   │   ├── endo4dwam_joint.yaml
 │   │   └── endo4dwam_idm.yaml
 │   └── task/
-│       ├── endowam_uncond_1cam_1e-4.yaml # base 任务配置
+│       ├── endowam_fastwam_baseline_1cam_1e-4.yaml # 固化的原始 FastWAM control
+│       ├── endowam_uncond_1cam_1e-4.yaml # base + LoRA 任务配置
 │       └── endowam_joint_1cam_1e-4.yaml  # joint 任务配置
 ├── scripts/
 │   ├── TRAINING.md                       # 详细训练文档
@@ -161,17 +165,25 @@ python scripts/build_endowam_episodes_stats.py \
 训练时文本编码器被冻结且不加载到 GPU，所以 prompt 的编码结果需要提前缓存到磁盘：
 
 ```bash
-python scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4
+python scripts/precompute_text_embeds.py task=endowam_fastwam_baseline_1cam_1e-4 +overwrite=false
 ```
 
 缓存写入 `./data/text_embeds_cache/endowam/`，**uncond 与 joint 共用同一份**，只需运行一次。
 多 GPU 加速：
 
 ```bash
-torchrun --standalone --nproc_per_node=2 scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4
+torchrun --standalone --nproc_per_node=2 scripts/precompute_text_embeds.py task=endowam_fastwam_baseline_1cam_1e-4 +overwrite=false
 ```
 
 ## 训练
+
+严格原始 FastWAM control（训练联合生成视频/动作，验证与部署只生成动作）：
+
+```bash
+bash scripts/train_zero1.sh 2 task=endowam_fastwam_baseline_1cam_1e-4
+```
+
+History、geometry与persistent memory的正交消融命令见[`scripts/TRAINING.md`](scripts/TRAINING.md)。
 
 专用启动脚本（GPU 编号、LoRA 配置和超参都以变量形式暴露在脚本顶部）：
 
@@ -231,7 +243,7 @@ runs/<run_root>/<run_id>/
 python scripts/val_chunk_endowam.py \
   --ckpt runs/endowam_uncond_lora/<run_id>/checkpoints/weights/step_080000.pt \
   --task endowam_uncond_1cam_1e-4 \
-  --dataset_root /path/to/endowam_pseudo_z60/esophagus/rot045 \
+  --dataset_root /path/to/endowam_pseudo_z60/esophagus \
   --episode 144 --execution_horizon 8 --max_windows 4000 \
   --num_video_saves 0 --gpu 0
 ```

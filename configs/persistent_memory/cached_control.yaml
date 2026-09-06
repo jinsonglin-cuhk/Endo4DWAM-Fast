@@ -1,0 +1,9 @@
+# @package _global_
+# No memory parameters, but uses the same split video-prefill/action-cache
+# training execution as memory=on. Compare this against `on` to isolate memory.
+model:
+  training_attention_path: cached
+  memory:
+    enable: false
+    action_read: false
+    geometry_read: false

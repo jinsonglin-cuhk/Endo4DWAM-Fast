@@ -1,0 +1,70 @@
+# @package _global_
+#
+# Immutable original FastWAM control:
+#   train = joint future-video + action denoising
+#   eval/deploy = action-only inference (no future-video denoise/decode)
+# Enhanced modules are pinned explicitly so future model-default changes cannot
+# silently alter this control. This is full MoT fine-tuning, not the LoRA recipe.
+defaults:
+  - override /data: endowam_endoscope
+  - override /model: endo4dwam
+  - _self_
+
+batch_size: 4
+num_workers: 8
+learning_rate: 1e-4
+lr_scheduler_type: cosine
+max_steps: 40000
+num_epochs: 10
+log_every: 10
+save_every: 1000
+eval_every: 500
+eval_num_inference_steps: 10
+eval_generate_video: false
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+save_total_limit: 1
+
+model:
+  mot_checkpoint_mixed_attn: false
+  training_attention_path: mixed
+  action_to_video_grad_scale: 1.0
+  action_to_memory_grad_scale: 1.0
+  video_dit_config:
+    num_history_latent_frames: 1
+  memory:
+    enable: false
+    action_read: false
+    geometry_read: false
+  geometry:
+    enable: false
+    depth:
+      enable: false
+    motion:
+      enable: false
+    num_supervised_steps: 4
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+    lambda_depth: 0.0
+    lambda_flow: 0.0
+  lora:
+    enable: false
+    train_base: false
+
+data:
+  train:
+    num_frames: 33
+
+curriculum:
+  enable: false
+  geometry_unfreeze_step: 0
+  head_unfreeze_step: 0
+  memory_unfreeze_step: 0
+  video_unfreeze_step: 0
+  action_unfreeze_step: 0
+  action_to_video_grad_scale_before: 1.0
+  action_to_video_grad_scale_after: 1.0
+  action_to_memory_grad_scale_before: 1.0
+  action_to_memory_grad_scale_after: 1.0

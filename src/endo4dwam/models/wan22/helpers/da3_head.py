@@ -51,23 +51,32 @@ def build_da3_head(model_id: str = "depth-anything/DA3MONO-LARGE", *, patch_size
     than no depth supervision at all. Loading fewer keys than expected raises.
     """
     from depth_anything_3.model.dpt import DPT  # lazy: not a hard dependency
-    from safetensors.torch import load_file
+    from safetensors import safe_open
 
     snapshot = _find_snapshot(model_id)
-    head_cfg = {k: v for k, v in json.load(open(snapshot / "config.json"))["config"]["head"].items()
+    head_cfg = {k: v for k, v in json.loads((snapshot / "config.json").read_text())["config"]["head"].items()
                 if k != "__object__"}
     if output_dim is not None:
-        head_cfg["output_dim"] = int(output_dim)
+        # DPT reserves the last channel for confidence when output_dim > 1.
+        head_cfg["output_dim"] = int(output_dim) + 1
+        head_cfg["activation"] = "linear"
 
     head = DPT(patch_size=patch_size, **head_cfg)
-    state = load_file(str(snapshot / "model.safetensors"))
-    head_state = {k[len(_HEAD_PREFIX):]: v for k, v in state.items() if k.startswith(_HEAD_PREFIX)}
+    with safe_open(str(snapshot / "model.safetensors"), framework="pt", device="cpu") as state:
+        head_state = {k[len(_HEAD_PREFIX):]: state.get_tensor(k)
+                      for k in state.keys() if k.startswith(_HEAD_PREFIX)}
     if not head_state:
         raise ValueError(f"No `{_HEAD_PREFIX}*` keys in {snapshot / 'model.safetensors'}")
 
+    projection_prefix = f"scratch.output_conv2.{len(head.scratch.output_conv2) - 1}."
+    if output_dim is not None:
+        # Reinitialise the modality-specific final projection, retaining the pretrained neck.
+        head_state = {k: v for k, v in head_state.items() if not k.startswith(projection_prefix)}
     missing, unexpected = head.load_state_dict(head_state, strict=False)
     # output_dim changes legitimately alter the final conv, so allow those.
-    hard_missing = [k for k in missing if "output_conv2" not in k]
+    hard_missing = [k for k in missing if not (output_dim is not None and k.startswith(projection_prefix))]
+    if unexpected:
+        raise ValueError(f"Unexpected DA3 head keys: {unexpected}")
     logger.info("DA3 head %s: loaded %d keys, missing=%d (hard=%d), unexpected=%d",
                 model_id, len(head_state), len(missing), len(hard_missing), len(unexpected))
     if len(hard_missing) > max_missing:

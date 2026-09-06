@@ -47,10 +47,5 @@ weight_decay: 1e-2
 resume: null
 save_total_limit: 1   # keep only the latest checkpoint, matching EndoWAM save_total_limit=1
 
-# NOTE on EndoWAM params with NO Endo4DWAM equivalent:
-#   - LoRA (rank16/alpha32/dropout/target_modules): Endo4DWAM does FULL fine-tuning
-#     of the DiT (MoT), no PEFT path exists. See trainer._apply_dit_only_train_mode.
-#   - save_total_limit: not supported; Endo4DWAM keeps every checkpoint under
-#     runs/<task>/<run_id>/checkpoints/. Prune manually if disk is tight.
-#   - freeze text_encoder/vae: already the default here (load_text_encoder=false,
-#     only DiT is trainable), so no flag needed.
+# Video LoRA is enabled above; save_total_limit rotates both weights and state.
+# Text encoder and VAE are frozen.

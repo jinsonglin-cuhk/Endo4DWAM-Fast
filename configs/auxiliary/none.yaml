@@ -1,0 +1,11 @@
+# @package _global_
+model:
+  geometry:
+    enable: false
+    depth:
+      enable: false
+    motion:
+      enable: false
+  loss:
+    lambda_depth: 0.0
+    lambda_flow: 0.0

@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -27,6 +27,13 @@ logger = get_logger(__name__)
 
 
 class Wan22Trainer:
+    @staticmethod
+    def _zero_stage(accelerator) -> str | int:
+        plugin = accelerator.state.deepspeed_plugin
+        if plugin is None:
+            return "none"
+        return plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown")
+
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
         self.train_dataset = train_dataset
@@ -44,6 +51,7 @@ class Wan22Trainer:
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        self.eval_generate_video = bool(cfg.get("eval_generate_video", True))
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
@@ -58,17 +66,20 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        curriculum_cfg = cfg.get("curriculum") or {}
+        self.curriculum = OmegaConf.to_container(curriculum_cfg, resolve=True) \
+            if isinstance(curriculum_cfg, DictConfig) else dict(curriculum_cfg)
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
         )
-        
+        zero_stage = self._zero_stage(self.accelerator)
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
+            zero_stage,
             self.accelerator.num_processes,
             self.accelerator.process_index,
             self.mixed_precision,
@@ -85,10 +96,8 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = [p for p in self.model.dit.parameters() if p.requires_grad]
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+        self._apply_curriculum(self.model, step=0)
+        trainable_params = self._optimizer_parameters(self.model)
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -160,6 +169,38 @@ class Wan22Trainer:
         if self.wandb_run is None:
             return
         self.wandb_run.log(payload, step=self.global_step)
+
+    def _format_eval_metrics(self, metrics: dict) -> tuple[str, dict]:
+        """Build eval logging without assuming future-video metrics exist."""
+        description = "[eval] step=%d val_loss=%.4f" % (
+            self.global_step,
+            metrics["val_loss"],
+        )
+        payload = {"eval/val_loss": float(metrics["val_loss"])}
+        video_keys = ("psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg")
+        present_video_keys = [key for key in video_keys if key in metrics]
+        if present_video_keys and len(present_video_keys) != len(video_keys):
+            missing = sorted(set(video_keys) - set(present_video_keys))
+            raise ValueError(f"Incomplete future-video eval metrics; missing {missing}")
+        if present_video_keys:
+            description += " infer_psnr=%.4f infer_ssim=%.4f" % (
+                metrics["psnr_rd"],
+                metrics["ssim_rd"],
+            )
+            for key in video_keys:
+                payload[f"eval/{key}"] = float(metrics[key])
+        for key in ("action_l2", "action_l1"):
+            if key in metrics:
+                description += f" {key}=%.4f" % metrics[key]
+                payload[f"eval/{key}"] = float(metrics[key])
+        if "flow_epe" in metrics:
+            description += " depth_abs_rel=%.4f flow_epe=%.4f" % (
+                metrics["depth_abs_rel"], metrics["flow_epe"]
+            )
+        for key in ("depth_abs_rel", "depth_rmse", "flow_epe"):
+            if key in metrics:
+                payload[f"eval/{key}"] = float(metrics[key])
+        return description, payload
 
     def _finish_wandb(self):
         if self.wandb_run is None:
@@ -283,8 +324,7 @@ class Wan22Trainer:
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
         logger.info("Setting DiT to train mode and freezing other model components.")
-        model = self.accelerator.unwrap_model(self.model)
-        self._apply_dit_only_train_mode(model)
+        self._refresh_train_mode()
 
     @staticmethod
     def _apply_dit_only_train_mode(model):
@@ -301,10 +341,111 @@ class Wan22Trainer:
                     p.requires_grad = True
         else:
             model.dit.requires_grad_(True)
+        if getattr(model, "geometry", None) is not None and model.geometry_config.get("head", {}).get("freeze", False):
+            for name in ("depth_head", "motion_head"):
+                head = getattr(model.geometry, name, None)
+                if head is not None:
+                    head.eval()
+                    head.requires_grad_(False)
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+
+    def _optimizer_parameters(self, model):
+        """Include dormant curriculum params without allocating state for frozen base weights."""
+        enabled = bool(self.curriculum.get("enable", False))
+        selected = []
+        for name, param in model.dit.named_parameters():
+            if param.requires_grad:
+                selected.append(param)
+                continue
+            if enabled and (
+                name.startswith("mixtures.action.")
+                or name.startswith("geometry.")
+                or name.startswith("world_memory.")
+                or "lora_" in name
+                or (getattr(model, "_lora_train_base", False) and name.startswith("mixtures.video."))
+            ):
+                selected.append(param)
+        proprio_encoder = getattr(model, "proprio_encoder", None)
+        if proprio_encoder is not None:
+            selected.extend(list(proprio_encoder.parameters()))
+        # Shared expert references can expose the same Parameter through multiple paths.
+        unique = []
+        seen = set()
+        for param in selected:
+            if id(param) not in seen:
+                seen.add(id(param))
+                unique.append(param)
+        if not unique:
+            raise ValueError("No optimizer parameters selected")
+        return unique
+
+    def _curriculum_active(self, key: str, step: int) -> bool:
+        value = self.curriculum.get(key, 0)
+        return value is not None and int(step) >= int(value)
+
+    def _apply_curriculum(self, model, step: int) -> None:
+        """Apply S0/S1/S2-style progressive module unfreezing at an optimizer step."""
+        if not bool(self.curriculum.get("enable", False)):
+            return
+
+        video = model.mot.mixtures["video"]
+        video.requires_grad_(False)
+        video_active = self._curriculum_active("video_unfreeze_step", step)
+        video.train(video_active)
+        if video_active:
+            if getattr(model, "_lora_enabled", False) and not getattr(model, "_lora_train_base", False):
+                for name, param in video.named_parameters():
+                    param.requires_grad = "lora_" in name
+            else:
+                video.requires_grad_(True)
+
+        action = model.mot.mixtures["action"]
+        action_active = self._curriculum_active("action_unfreeze_step", step)
+        action.train(action_active)
+        action.requires_grad_(action_active)
+        gate_key = "action_to_video_grad_scale_after" if action_active else "action_to_video_grad_scale_before"
+        if gate_key in self.curriculum:
+            model.action_to_video_grad_scale = float(self.curriculum[gate_key])
+            if not 0.0 <= model.action_to_video_grad_scale <= 1.0:
+                raise ValueError(f"curriculum.{gate_key} must be in [0,1]")
+        memory_gate_key = (
+            "action_to_memory_grad_scale_after"
+            if action_active else "action_to_memory_grad_scale_before"
+        )
+        if memory_gate_key in self.curriculum:
+            model.action_to_memory_grad_scale = float(self.curriculum[memory_gate_key])
+            if not 0.0 <= model.action_to_memory_grad_scale <= 1.0:
+                raise ValueError(f"curriculum.{memory_gate_key} must be in [0,1]")
+        proprio = getattr(model, "proprio_encoder", None)
+        if proprio is not None:
+            proprio.train(action_active)
+            proprio.requires_grad_(action_active)
+
+        geometry = getattr(model, "geometry", None)
+        if geometry is not None:
+            geometry_active = self._curriculum_active("geometry_unfreeze_step", step)
+            geometry.train(geometry_active)
+            geometry.requires_grad_(geometry_active)
+            for name in ("depth_head", "motion_head"):
+                head = getattr(geometry, name, None)
+                if head is not None:
+                    head_active = self._curriculum_active("head_unfreeze_step", step)
+                    head.train(head_active)
+                    head.requires_grad_(head_active)
+
+        memory = getattr(model, "world_memory", None)
+        if memory is not None:
+            memory_active = self._curriculum_active("memory_unfreeze_step", step)
+            memory.train(memory_active)
+            memory.requires_grad_(memory_active)
+
+    def _refresh_train_mode(self) -> None:
+        model = self.accelerator.unwrap_model(self.model)
+        self._apply_dit_only_train_mode(model)
+        self._apply_curriculum(model, self.global_step)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -349,8 +490,6 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
             action_horizon = int(action.shape[1])
 
         proprio = None
@@ -375,7 +514,7 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
-        return {
+        result = {
             "video": video,
             "prompt": prompt,
             "action": action,
@@ -384,6 +523,13 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "action_horizon": action_horizon,
         }
+        for key in ("depth", "depth_mask", "flow", "flow_mask", "depth_weight"):
+            value = sample.get(key)
+            if value is not None:
+                if not isinstance(value, torch.Tensor):
+                    value = torch.as_tensor(value)
+                result[key] = value.unsqueeze(0)
+        return result
 
     @torch.no_grad()
     def evaluate(self):
@@ -401,25 +547,26 @@ class Wan22Trainer:
 
         # 1. training loss
         with self.accelerator.autocast():
-            val_loss, _ = model.training_loss(sample)
+            val_loss, val_loss_dict = model.training_loss(
+                sample, geometry_eval=getattr(model, "geometry", None) is not None
+            )
             val_loss = val_loss.float().item()
         
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
         proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-        input_image = video0[:, 0].unsqueeze(0)
+        history = int(getattr(model, "num_history_pixel_frames", 1))
+        input_image = video0[:, :history].permute(1, 0, 2, 3)
         _, num_frames, _, _ = video0.shape
 
-        # 2. inference and video saving
+        # 2. Policy inference. The baseline deliberately uses the deployment
+        # path here: history-video prefill + action diffusion, no future video.
         infer_kwargs = {
             "input_image": input_image,
-            "num_frames": num_frames,
-            "action": action,
             "action_horizon": sample['action_horizon'],
             "proprio": proprio,
             "text_cfg_scale": 1.0,
-            "action_cfg_scale": 1.0,
             "num_inference_steps": self.eval_num_inference_steps,
             "seed": 42,
             "tiled": False,
@@ -431,24 +578,38 @@ class Wan22Trainer:
         else:
             infer_kwargs["prompt"] = prompt
 
-        pred = model.infer(
-            **infer_kwargs,
-        )
-        
-        pred_video = pred["video"]
+        if self.eval_generate_video:
+            infer_kwargs.update({
+                "num_frames": num_frames,
+                "action": action,
+                "action_cfg_scale": 1.0,
+            })
+            pred = model.infer(**infer_kwargs)
+        else:
+            if "num_video_frames" in inspect.signature(model.infer_action).parameters:
+                raise ValueError(
+                    "eval_generate_video=false requires a genuinely action-only infer_action; "
+                    f"{type(model).__name__} still requires/generated future video"
+                )
+            pred = model.infer_action(**infer_kwargs)
+
         pred_action = pred.get("action", None)
 
-        # 3. inference metrics against GT video
-        pred_video_tensor = pil_frames_to_video_tensor(pred_video)
-        gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
-
-        assert pred_video_tensor.shape == gt_video_tensor.shape, (
-            "Eval infer prediction/GT shape mismatch: "
-            f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-        )
-
-        psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
-        ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+        # Video metrics remain available for world-model diagnostics, but are
+        # entirely skipped by action-only validation.
+        video_metrics = [0.0] * 6
+        video_path = None
+        if self.eval_generate_video:
+            pred_video_tensor = pil_frames_to_video_tensor(pred["video"])
+            gt_video_tensor = (
+                (video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5
+            ).contiguous()
+            assert pred_video_tensor.shape == gt_video_tensor.shape, (
+                "Eval infer prediction/GT shape mismatch: "
+                f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+            )
+            psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
+            ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
 
         action_l1 = None
         action_l2 = None
@@ -505,49 +666,53 @@ class Wan22Trainer:
             action_l1 = action_diff.abs().mean().item()
             action_l2 = action_diff.pow(2).mean().item()
 
-        # 4. VAE reconstruction metrics against GT video
-        gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
-        vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
-        vae_recon_video = model._decode_latents(vae_latents, tiled=False)
-        vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
-
-        assert vae_video_tensor.shape == gt_video_tensor.shape, (
-            "Eval VAE reconstruction/GT shape mismatch: "
-            f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
-        )
-
-        psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
-        ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
-
-        psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
-        ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
-
-        stitched_video_tensor = torch.cat(
-            [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-            dim=2,
-        ).contiguous()
-        stitched_frames = []
-        for t in range(stitched_video_tensor.shape[1]):
-            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-            stitched_frames.append(Image.fromarray(frame))
-
-        video_path = os.path.join(
-            self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
-        )
-        save_mp4(stitched_frames, video_path, fps=8)
+        # 4. Optional future-video and VAE reconstruction diagnostics.
+        if self.eval_generate_video:
+            gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+            vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
+            vae_recon_video = model._decode_latents(vae_latents, tiled=False)
+            vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
+            assert vae_video_tensor.shape == gt_video_tensor.shape, (
+                "Eval VAE reconstruction/GT shape mismatch: "
+                f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
+            )
+            psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
+            ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
+            psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
+            ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
+            video_metrics = [
+                psnr_rollout_vs_gt,
+                ssim_rollout_vs_gt,
+                psnr_rollout_vs_decode,
+                ssim_rollout_vs_decode,
+                psnr_decode_vs_gt,
+                ssim_decode_vs_gt,
+            ]
+            stitched_video_tensor = torch.cat(
+                [pred_video_tensor, vae_video_tensor, gt_video_tensor], dim=2
+            ).contiguous()
+            stitched_frames = []
+            for t in range(stitched_video_tensor.shape[1]):
+                frame = (
+                    stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy()
+                    * 255.0
+                ).astype(np.uint8)
+                stitched_frames.append(Image.fromarray(frame))
+            video_path = os.path.join(
+                self.eval_dir,
+                f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            )
+            save_mp4(stitched_frames, video_path, fps=8)
 
         local_metrics = torch.tensor(
             [
                 float(val_loss),
-                float(psnr_rollout_vs_gt),
-                float(ssim_rollout_vs_gt),
-                float(psnr_rollout_vs_decode),
-                float(ssim_rollout_vs_decode),
-                float(psnr_decode_vs_gt),
-                float(ssim_decode_vs_gt),
+                *(float(value) for value in video_metrics),
                 float(action_l2) if action_l2 is not None else -1.0,
                 float(action_l1) if action_l1 is not None else -1.0,
+                float(val_loss_dict.get("depth_abs_rel", 0.0)),
+                float(val_loss_dict.get("depth_rmse", 0.0)),
+                float(val_loss_dict.get("flow_epe", 0.0)),
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
@@ -556,20 +721,28 @@ class Wan22Trainer:
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        geometry_mean = gathered_metrics[:, 9:12].mean(dim=0)
 
         if was_dit_training:
             self._set_dit_only_train_mode()
 
-        result = {
-            "val_loss": float(mean_metrics[0].item()),
-            "psnr_rg": float(mean_metrics[1].item()),
-            "ssim_rg": float(mean_metrics[2].item()),
-            "psnr_rd": float(mean_metrics[3].item()),
-            "ssim_rd": float(mean_metrics[4].item()),
-            "psnr_dg": float(mean_metrics[5].item()),
-            "ssim_dg": float(mean_metrics[6].item()),
-            "video_path": video_path,
-        }
+        result = {"val_loss": float(mean_metrics[0].item())}
+        if self.eval_generate_video:
+            result.update({
+                "psnr_rg": float(mean_metrics[1].item()),
+                "ssim_rg": float(mean_metrics[2].item()),
+                "psnr_rd": float(mean_metrics[3].item()),
+                "ssim_rd": float(mean_metrics[4].item()),
+                "psnr_dg": float(mean_metrics[5].item()),
+                "ssim_dg": float(mean_metrics[6].item()),
+                "video_path": video_path,
+            })
+        if getattr(model, "geometry", None) is not None:
+            result.update({
+                "depth_abs_rel": float(geometry_mean[0].item()),
+                "depth_rmse": float(geometry_mean[1].item()),
+                "flow_epe": float(geometry_mean[2].item()),
+            })
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
@@ -719,6 +892,13 @@ class Wan22Trainer:
         self.run_start_time = time.perf_counter()
 
         while self.global_step < self.max_steps:
+            if bool(self.curriculum.get("enable", False)):
+                transitions = {
+                    int(value) for key, value in self.curriculum.items()
+                    if key.endswith("_unfreeze_step") and value is not None
+                }
+                if self.global_step in transitions:
+                    self._refresh_train_mode()
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
@@ -795,30 +975,8 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
-                                self.global_step,
-                                metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
-                            )
-                            if "action_l2" in metrics:
-                                description += " action_l2=%.4f" % metrics["action_l2"]
-                            if "action_l1" in metrics:
-                                description += " action_l1=%.4f" % metrics["action_l1"]
+                            description, eval_payload = self._format_eval_metrics(metrics)
                             logger.info(description)
-                            eval_payload = {
-                                "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
-                            }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:

@@ -38,9 +38,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         is_training_set=False,
         global_sample_stride=1,
         action_video_freq_ratio: int = 1,
+        num_history_latent_frames: int = 1,
+        vae_temporal_downsample_factor: int = 4,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
+        geometry=None,
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
         self.lerobot_dataset = BaseLerobotDataset(
@@ -53,14 +56,42 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             global_sample_stride=global_sample_stride,
         )
     
+        self.is_training_set = is_training_set
+        self.geometry_reader = None
+        if geometry and geometry.get("enable", False):
+            from .geometry import GeometryLabels
+            self.geometry_reader = GeometryLabels(
+                self.lerobot_dataset.multi_dataset._datasets, geometry,
+                source_hw=shape_meta["images"][0]["raw_shape"][-2:],
+                target_hw=video_size, num_frames=num_frames,
+                video_stride=action_video_freq_ratio, sample_stride=global_sample_stride,
+            )
+
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
+        self.num_history_latent_frames = int(num_history_latent_frames)
+        self.vae_temporal_downsample_factor = int(vae_temporal_downsample_factor)
+        if self.num_history_latent_frames < 1:
+            raise ValueError("`num_history_latent_frames` must be >= 1")
+        self.num_history_video_frames = (
+            self.vae_temporal_downsample_factor * (self.num_history_latent_frames - 1) + 1
+        )
+        self.history_action_steps = (
+            self.num_history_video_frames - 1
+        ) * int(action_video_freq_ratio)
         
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+        if self.num_history_video_frames >= len(self.video_sample_indices):
+            raise ValueError(
+                "History must leave at least one future video transition: "
+                f"history={self.num_history_video_frames}, video_frames={len(self.video_sample_indices)}"
+            )
+        if self.geometry_reader is not None and self.geometry_reader.k != self.num_history_latent_frames:
+            raise ValueError("Dataset and geometry history lengths differ")
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -92,6 +123,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     logger.info("Calculating dataset stats for normalization...")
                     dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
                     work_dir = misc.get_work_dir()
+                    os.makedirs(work_dir, exist_ok=True)
                     save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
                 else:
                     dataset_stats = None
@@ -104,6 +136,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
                     work_dir = misc.get_work_dir()
+                    os.makedirs(work_dir, exist_ok=True)
                     save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
 
             processor.set_normalizer_from_stats(dataset_stats)
@@ -199,13 +232,19 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # Proxy (from lerobot): 
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        # Actions covered by the clean history frames are observed context, not
+        # prediction targets. K=2 consumes eight raw action steps at ratio=2;
+        # the fair 41-frame protocol still leaves the fixed 32-step horizon.
+        h = self.history_action_steps
+        action = sample["action"][h:] # [future T, action_dim]
+        proprio = sample["proprio"][h:-1, :] # state at each future action start
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        future_video_transitions = video.shape[1] - self.num_history_video_frames
+        if action.shape[0] % future_video_transitions != 0:
             raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                "`action` horizon must be divisible by future video transitions, "
+                f"got {action.shape[0]} and {future_video_transitions}"
             )
 
         task = sample["instruction"]
@@ -228,9 +267,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "context": context,
             "context_mask": context_mask,
             "image_is_pad": image_is_pad,
-            "action_is_pad": sample["action_is_pad"],
-            "proprio_is_pad": sample["proprio_is_pad"],
+            "action_is_pad": sample["action_is_pad"][h:],
+            "proprio_is_pad": sample["proprio_is_pad"][h:-1],
         }
+        if self.geometry_reader is not None:
+            data.update(self.geometry_reader.read(sample))
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -271,6 +312,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         try:
             data = self._get(idx)
         except Exception as e:
+            if not self.is_training_set or self.geometry_reader is not None:
+                raise
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())

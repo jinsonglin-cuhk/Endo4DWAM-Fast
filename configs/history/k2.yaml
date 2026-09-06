@@ -1,0 +1,11 @@
+# @package _global_
+# Fair history control: 5 observed RGB frames, while retaining the baseline's
+# 32 future actions and four future latent video steps (41 raw frames total).
+model:
+  video_dit_config:
+    num_history_latent_frames: 2
+  geometry:
+    num_supervised_steps: 4
+data:
+  train:
+    num_frames: 41

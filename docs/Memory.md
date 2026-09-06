@@ -1,3 +1,76 @@
+# Persistent visual memory 决策与实现记录（2026-09-06）
+
+本文把“记忆”分成两类，避免此前把历史帧、KV cache 与跨 chunk 状态混为一谈：
+
+- `K` 帧 history：当前决策窗口的短时原始观测。K=2对应5个VAE输入像素帧、2个clean latent frame。
+- `M_t`：固定64×1024 token的长时压缩状态，在action chunk之间显式传递。
+- video KV cache：一次 action diffusion 的计算缓存，每次 replan 重建，不是跨chunk记忆。
+- geometry registers：训练期查询 token，每个sample重建，部署时删除，也不是persistent state。
+
+## 当前 reference 方案
+
+```text
+previous M ───────────────┐
+                         v
+RGB history -> video expert L18 -> visual-only memory updater -> next M
+       │                                      │
+       ├──────── history K/V ─────────────────┼──> action expert
+       └── layers 12/14/16/18 ──> depth/flow registers
+                                              ^
+                                      registers also read M
+```
+
+实现位置：
+
+- `persistent_memory.py`：零初始化显式状态、learned slot identity、逐history latent更新、共享1024→3072 action adapter。
+- `mot.py`：cached action attention加入memory K/V；video query永远没有action K/V；Base action只看到history video而非future video。
+- `endo4dwam.py`：训练窗口内memory unroll、geometry读取memory、`init_memory()`与`infer_action(memory_state=...)`协议。
+- `trainer.py`：`memory_unfreeze_step`及独立`action_to_memory_grad_scale_*`课程。
+- `val_chunk_endowam.py`：episode开始重置，成功窗口间传递state。
+
+Memory writer 的唯一输入是previous memory和clean history hidden state。Action token、伪action标签和noisy future video都不能进入写接口。Action loss仍可沿“读取memory”反向影响writer，因此另外使用straight-through gradient scale；S0/S1为0，S2 reference为0.05。Geometry loss不经过这道门，负责先把memory锚定到深度/运动结构。
+
+训练batch是随机窗口，当前不保存跨batch状态。每个窗口从M0开始并按K个history latent frame unroll；显式外部state进入时先detach。这样训练/部署的更新算子一致，但训练看到的memory时间跨度仍短于真正rollout。严格的跨窗口truncated BPTT是后续实验项，需要episode顺序sampler、每rank state表、断点恢复和episode边界同步，不能只在model里缓存一个tensor来冒充。
+
+## 已实现、保留消融与未实现
+
+| 项目 | 状态 |
+|---|---|
+| Base action读取history+memory，不读future video | 已实现 |
+| Memory只由history视觉写入 | 已实现 |
+| Geometry registers读取history+memory | 已实现 |
+| `memory.action_read` / `geometry_read`独立开关 | 已实现 |
+| mixed baseline / cached-no-memory execution control | 已实现 |
+| K1/K2固定32步action、4步future latent的公平窗口 | 已实现（33/41 raw frames） |
+| Episode级显式reset/carry | 离线chunk与RobotWin policy已实现 |
+| Depth clip-affine + gradient loss | 已实现，可配置 |
+| Flow masked Charbonnier | 已实现，保留SmoothL1消融 |
+| Joint读取future video | 有意保留的消融；Base `infer_joint`默认仍返回memory-aware action |
+| Video expert读取persistent memory | 当前未实现；reference只让action/register读取 |
+| 跨训练batch/episode BPTT | 未实现 |
+| S3真实动作γ=1对齐 | 缺真实动作训练与独立验证 |
+
+为什么保留历史帧：memory是有损压缩，无法替代最近连续帧中直接可见的器械速度、组织形变和遮挡变化；反过来，K=2只覆盖局部时间，无法替代跨多个action chunk的状态。是否对控制有效仍必须做等预算四组消融：K1/no-memory、K2/no-memory、K1/memory、K2/memory，并以action/rollout和快速运动/遮挡子集为主，不能只看辅助loss。
+
+---
+
+# Pipeline 修复记录（2026-09-06）
+
+当前可执行协议以 [TRAINING.md](../scripts/TRAINING.md) 和 [几何设计](geometry_motion_distillation.md) 为准。下面 2026-09-04 的记录保留为历史实验，不应直接作为当前运行步骤。
+
+- 修复 RGB 直接拉伸：360×480 → 256×341 → 中心裁剪256×320；旧“本来就在裁剪”的结论错误。
+- 增加固定 seed 的 episode 90/10 划分；新 run ID 带 `_crop_split`，避免覆盖旧实验。
+- 几何训练已对齐现有 EdGE causal-streaming 与 RAFT stride=2 sidecar；515/515 episode 预检通过。保留 legacy QC 兼容，ureter depth 仍降权0.4。
+- Motion DPT 修正为 u/v/confidence 三个 logits，u/v 使用线性激活；最终投影重新初始化。Trainer 保留 head.freeze 设置。
+- Geometry readout默认从DA3 DPT切换为EdGE原生DPT：62个depth-head权重完整加载；四个`[I;I]`初始化的1024→2048 adapter对齐register与EdGE frame/global维度。Depth保留EdGE projection，motion只复用neck并重置有符号u/v projection；同形DA3类经数值对比并不等价，未作为替代实现；`geometry.head.type=da3`保留为消融。
+- 评估使用训练 config 快照；Joint 传视频长度；异常记入 summary 并非零退出；验证读取失败不随机替换样本。
+- 修复空目录续训和多机 Accelerate 参数，保留 TCPStore 主节点至所有节点读取 run ID。
+- K=2使用5帧history，并从action/proprio/pad target裁掉已观察的8步。旧33帧smoke得到`[24,3]`；当前公平配置把窗口扩为41帧，目标保持`[32,3]`。
+- observed flow、action→video K/V 的 γ_p straight-through 梯度门、S0→S2 自动渐进解冻、训练期 depth/flow 验证指标已实现；IDM 和依赖真实动作数据的 S3 未实现。
+- 新增 K2 task `endowam_geometry_k2_1cam_1e-4`；最新CPU回归覆盖persistent memory和启动前配置契约，完整5B GPU backward仍需在目标训练环境执行。
+
+---
+
 # Endo4DWAM-Fast 建库 + 全量改名 + 几何监督方案 改动记录（2026-09-04）
 
 ## 1. 仓库建立：由 FastWAM 工作区快照播种
@@ -190,9 +263,10 @@ pseudo-action alignment（含梯度门 γ_p）→ real embodiment alignment。
 （旧 checkpoint 在新数据上本就无法续训），且名字里的 `rot45` 已是错的。
 
 **环境坑**（[scripts/TRAINING.md](../scripts/TRAINING.md) 开头已记录）：
-1. `fastwam` env 的 editable 安装**仍指向旧仓库** `/mnt/data2/ljs/FastWAM/src/fastwam`，
+1. `fastwam` env 的 editable 安装可能仍指向旧仓库 `/mnt/data2/ljs/FastWAM/src/fastwam`，
    本仓库的 `endo4dwam` 未安装 ⇒ `import endo4dwam` 报错，而 `import fastwam` **静默跑旧代码**。
-   解法：`pip install -e .` 或 `PYTHONPATH=src`。
+   解法：在本仓库执行`pip install -e .`或设置`PYTHONPATH=src`。项目依赖现已显式包含`addict==2.4.0`，
+   2026-09-06也已安装进本机`fastwam`环境。
 2. 别用 `openpi` 等其它 venv —— 没有 hydra。
 
 ---
@@ -209,7 +283,7 @@ lat0 ← pix0(仅此一帧)  lat1 ← pix1-4  lat2 ← pix5-8  lat3 ← pix9-12 
 
 严格因果但**感受野向前泄漏 2–4 步**（pix0 仍影响 lat0..lat3）；**组内 argmax 是第一帧而非最后一帧**
 （lat1: pix1=0.850 vs pix4=0.756）⇒ 监督时刻应取 **pix 1/5/9/13**，方案原写的 4/8/12/16 是错的。
-K 个 clean latent 帧 = 前 4(K−1)+1 个像素帧；**K=2 ⇒ future 监督步 4 降到 3**。
+K 个 clean latent 帧 = 前 4(K−1)+1 个像素帧；在当时固定17个视频帧的旧协议下，**K=2会让future监督步从4降到3**；当前41帧公平协议已消除该混杂。
 
 ### 11.2 history 帧数参数化（解掉「不动 attention mask」的矛盾）
 
@@ -221,7 +295,7 @@ action→history mask、`build_inputs` 切片、`training_loss` 丢弃步数，�
 [endo4dwam_idm.py](../src/endo4dwam/models/wan22/endo4dwam_idm.py) 两条分支同步参数化。
 `_compute_video_loss_per_sample` 的 `include_initial_video_step: bool` 改为
 `num_dropped_latent_steps: int`（bool 表达不了 K>1）。
-**推理仍只支持单帧 history，K>1 时四条 infer 路径显式报错**，不让训练/推理不一致被静默引入。
+**当时状态：推理仍只支持单帧history。该限制现已对Base/Joint解除**：两者接受与配置一致的K帧输入，Base还能更新persistent memory；IDM仍是K=1旧路径。此句仅保留用于说明当日修复顺序。
 
 **验证**：K=1 掩码与旧实现**逐位一致**；K=2 结构正确；pad 折叠重构在 200 组随机输入上与旧逻辑等价；
 键通过 `video_dit_config` 的签名校验；5 个 task config 仍全部 compose。
@@ -242,8 +316,7 @@ action→history mask、`build_inputs` 切片、`training_loss` 丢弃步数，�
 
 - **69% 的帧几乎静止**（p50 幅度 0.00083，p99 0.0589）。运动监督目标绝大多数是零，
   模型预测全零即可低 loss ⇒ λ_flow 与运动加权采样需据此设计。
-- **方向/步长约定判不明确**：高运动帧上做光度 warp，`t→t+1` 在 4/6 情形最优（+7~28%），
-  `t→t+2` 在 2/6（+1~3%），而 `flow_meta` 写 `stride: 2`。**须生成侧确认**，dataloader 依赖它。
+- **当时仅靠光度warp无法判定方向/步长**：高运动帧上`t→t+1`在4/6情形最优、`t→t+2`在2/6，而sidecar写`stride: 2`。后续已由生成器源码确认数组语义为`t→t+stride`，当前即`t→t+2`。
 - **纠正方案中的一处错误**：StereoMIS 的 RAFT 不是内镜微调版，只是官方仓库副本 + 标准
   `raft-things.pth`。在用的 `C_T_SKHT_V2` 训练更充分，无可换项。
 
@@ -261,18 +334,17 @@ action→history mask、`build_inputs` 切片、`training_loss` 丢弃步数，�
 
 **遗留 / 待办**
 - ~~**P0 未完**~~ —— **已全部完成**，见第 11 节。
-- ~~flow 方向/步长约定~~ —— **已定为 `t→t+1`**；已产出的 201 个 ercp flow 记的是 `stride: 2`，需重跑。
+- ~~flow 方向/步长约定~~ —— 已直接核对生成器：数组第`t`项由帧`t`与`t+stride`生成；当前sidecar的`stride: 2`即 **`t→t+2`**，无需因这一点重跑。
 - ~~深度几何变换~~ —— **已改存原图 360×480**，对齐歧义消失；换 MONO 后 ercp 符号在实际产出上翻正
   （ep0 +0.481→−0.517，ep1 +0.316→−0.624）。
-- **flow 归一化不能免除几何变换**：360×480 → 256×320 只在宽度方向裁剪，
-  所以 `u` 必须乘 **1.066667**、`v` 不变。漏掉不报错，只让水平运动目标系统性偏小 6.7%。
-- **几何对齐未定死**：已产出深度是方形 `224×224`，源 360×480（0.750）、训练管线 256×320（0.800）。
+- **flow 归一化不能免除几何变换**：360×480先等比resize到256×341再中心裁剪256×320，
+  所以 `u` 必须乘 **341/320=1.065625**、`v` 不变。漏掉不报错，只会让水平运动目标系统性偏小约6.6%。
+- **历史问题（已被原图深度替代）**：早期深度是方形 `224×224`，源 360×480（0.750）、训练管线 256×320（0.800）。
   用相关性区分「整幅压扁」与「中心裁剪」得 0.6444 vs 0.6423，**差异太小判不了**，
   须由生成侧把确切变换写进 `depth_meta`。
 - ~~history ≥2 帧推翻「不动 attention mask」~~ —— **已实现并验证**（第 11.2 节）。
-  代价确认：K=2 ⇒ future 监督时刻从 4 降到 3。**推理路径尚未支持 K>1**（目前显式报错），
-  真要用 K=2 训练，得先把 infer 改成接受 K 帧 history。
+  旧33帧K2会让future监督从4降到3；当前公平41帧K2保持4步。~~推理路径尚未支持K>1~~ 已完成：infer接受5个history像素帧，Base action path还支持跨chunk memory state。
 - **光流头没有预训练先验**：论文 Table 8 显示随机初始化的几何头比不加还差。λ_flow 需从小值起步并单独消融。
 - **算力**：全量 979,564 帧；A6000 8 张当前全部满载，每卡仅剩 16–19GB。
-- 训练前必做：`precompute_text_embeds.py`（`./data/text_embeds_cache/endowam` 目前为空；
-  新数据集只有一条 prompt，很快）。
+- 训练前必做：`precompute_text_embeds.py task=endowam_fastwam_baseline_1cam_1e-4 +overwrite=false`。
+  新数据集9条task记录去重后只有一条prompt；缓存状态应以目录实查为准，不再在记忆文档硬编码“为空”。

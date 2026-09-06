@@ -14,6 +14,8 @@ def clip_shared_affine_depth_loss(
     *,
     beta: float = 1.0,
     min_scale: float = 1e-3,
+    sample_weight: Optional[torch.Tensor] = None,
+    gradient_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SmoothL1 after aligning the prediction to the target with ONE (s, b) per clip.
 
@@ -55,14 +57,41 @@ def clip_shared_affine_depth_loss(
     scale = scale.detach().unsqueeze(1)
     shift = shift.detach().unsqueeze(1)
 
-    per_pixel = F.smooth_l1_loss(scale * p + shift, t, reduction="none", beta=beta)
+    aligned_flat = scale * p + shift
+    per_pixel = F.smooth_l1_loss(aligned_flat, t, reduction="none", beta=beta)
     loss = (per_pixel * w).sum(dim=1) / sw
+    if gradient_weight:
+        aligned = aligned_flat.reshape_as(pred).float()
+        target_f = target.float()
+        valid = torch.ones_like(target_f) if weight is None else weight.float()
+
+        def directional(a: torch.Tensor, t_: torch.Tensor, m: torch.Tensor, dim: int):
+            if dim == -1:
+                da, dt = a[..., 1:] - a[..., :-1], t_[..., 1:] - t_[..., :-1]
+                pair = m[..., 1:] * m[..., :-1]
+            else:
+                da, dt = a[..., 1:, :] - a[..., :-1, :], t_[..., 1:, :] - t_[..., :-1, :]
+                pair = m[..., 1:, :] * m[..., :-1, :]
+            err = F.smooth_l1_loss(da, dt, reduction="none", beta=beta)
+            numer = (err * pair).reshape(b_size, -1).sum(dim=1)
+            denom_grad = pair.reshape(b_size, -1).sum(dim=1).clamp(min=1.0)
+            return numer / denom_grad
+
+        grad_loss = 0.5 * (
+            directional(aligned, target_f, valid, -1)
+            + directional(aligned, target_f, valid, -2)
+        )
+        loss = loss + float(gradient_weight) * grad_loss
+    if sample_weight is not None:
+        loss = loss * sample_weight.float().reshape(b_size)
     return loss.mean(), scale.squeeze(1), shift.squeeze(1)
 
 
 def flow_loss(pred: torch.Tensor, target: torch.Tensor,
-              mask: Optional[torch.Tensor] = None, *, beta: float = 0.05) -> torch.Tensor:
-    """Masked SmoothL1 on a 2-channel flow field.
+              mask: Optional[torch.Tensor] = None, *, loss_type: str = "charbonnier",
+              beta: float = 0.05, epsilon: float = 1e-3,
+              alpha: float = 0.5) -> torch.Tensor:
+    """Masked robust loss on a 2-channel flow field.
 
     Flow has no scale ambiguity, so it is supervised directly. `beta` is small
     because the targets are small: the endoscope video is 69% near-static, with a
@@ -73,7 +102,20 @@ def flow_loss(pred: torch.Tensor, target: torch.Tensor,
     """
     if pred.shape != target.shape:
         raise ValueError(f"pred {tuple(pred.shape)} vs target {tuple(target.shape)}")
-    per_pixel = F.smooth_l1_loss(pred.float(), target.float(), reduction="none", beta=beta).sum(dim=2)
+    diff = pred.float() - target.float()
+    if loss_type == "charbonnier":
+        if epsilon <= 0 or not 0 < alpha <= 1:
+            raise ValueError("Charbonnier `epsilon` must be >0 and `alpha` in (0,1]")
+        # Subtract the zero-error floor so a perfect/masked-out prediction is
+        # exactly zero, which keeps metrics and distributed loss logs intuitive.
+        per_component = (diff.square() + epsilon ** 2).pow(alpha) - epsilon ** (2 * alpha)
+    elif loss_type == "smooth_l1":
+        per_component = F.smooth_l1_loss(
+            pred.float(), target.float(), reduction="none", beta=beta
+        )
+    else:
+        raise ValueError(f"Unsupported flow loss type: {loss_type}")
+    per_pixel = per_component.sum(dim=2)
     if mask is None:
         return per_pixel.mean()
     m = mask.float()

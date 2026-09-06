@@ -16,7 +16,7 @@
 #      loader requires it on v2.1; EndoWAM only ships stats_gr00t.json):
 #        python scripts/build_endowam_episodes_stats.py \
 #          --data_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60
-#      STATUS: currently MISSING for all three roots -- run this before training.
+#      Existing stats are skipped; verify files instead of relying on historical status.
 #   2. Precompute T5 text-embedding cache (see task config).
 #
 # Notes on the careful bits (input/output + normalization):
@@ -57,12 +57,14 @@ train:
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 2    # match EndoWAM pipeline: 32 action steps, 17 video frames
+  num_history_latent_frames: ${model.video_dit_config.num_history_latent_frames}
+  vae_temporal_downsample_factor: 4
                                 # (constraints OK: (33-1)%2==0, (32//2)=16 %4==0; VAE temporal (17-1)%4==0)
                                 # NOTE: 17 video frames ~= 2x the VAE/attn compute vs ratio=4 (9 frames).
                                 #       If you OOM on a 5B DiT, set this back to 4.
   video_size: [256, 320]        # final video fed to VAE (HxW); must be divisible by 32 (VAE 16x + patch 2x)
   camera_key: null
-  val_set_proportion: 0.0
+  val_set_proportion: 0.1
   is_training_set: true
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"   # single camera -> squeeze branch, value unused
@@ -87,11 +89,47 @@ train:
 
     train_transforms:
       - _target_: endo4dwam.datasets.lerobot.transforms.image.ToTensor
-      - _target_: torchvision.transforms.Resize
-        size: [256, 320]
+      - _target_: endo4dwam.datasets.dataset_utils.ResizeSmallestSideAspectPreserving
+        args: {img_h: 256, img_w: 320}
+      - _target_: endo4dwam.datasets.dataset_utils.CenterCrop
+        args: {img_h: 256, img_w: 320}
     val_transforms:
       - _target_: endo4dwam.datasets.lerobot.transforms.image.ToTensor
-      - _target_: torchvision.transforms.Resize
-        size: [256, 320]
+      - _target_: endo4dwam.datasets.dataset_utils.ResizeSmallestSideAspectPreserving
+        args: {img_h: 256, img_w: 320}
+      - _target_: endo4dwam.datasets.dataset_utils.CenterCrop
+        args: {img_h: 256, img_w: 320}
   text_embedding_cache_dir: ./data/text_embeds_cache/endowam
   context_len: 128
+
+  geometry:
+    enable: ${model.geometry.enable}
+    depth: ${model.geometry.depth.enable}
+    flow: ${model.geometry.motion.enable}
+    num_history_latent_frames: ${model.video_dit_config.num_history_latent_frames}
+    num_supervised_steps: ${model.geometry.num_supervised_steps}
+    flow_include_observed: ${model.geometry.motion.include_observed}
+    # Optional legacy QC override. Current EdGE labels carry their acceptance
+    # decision in causal_streaming + selected_after_video_ab_test metadata.
+    depth_qc_path: null
+    depth_procedure_weights: {ureter: 0.4}
+
+val:
+  _target_: ${data.train._target_}
+  dataset_dirs: ${data.train.dataset_dirs}
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  global_sample_stride: ${data.train.global_sample_stride}
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  num_history_latent_frames: ${data.train.num_history_latent_frames}
+  vae_temporal_downsample_factor: ${data.train.vae_temporal_downsample_factor}
+  video_size: ${data.train.video_size}
+  camera_key: ${data.train.camera_key}
+  val_set_proportion: ${data.train.val_set_proportion}
+  is_training_set: false
+  skip_padding_as_possible: false
+  concat_multi_camera: ${data.train.concat_multi_camera}
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
+  geometry: ${data.train.geometry}

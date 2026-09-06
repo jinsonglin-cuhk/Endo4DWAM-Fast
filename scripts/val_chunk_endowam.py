@@ -18,8 +18,8 @@ Endo4DWAM checkpoint，对某个 LeRobot episode 做开环（GT state / 真实�
     `processor.action_state_merger.backward` + `processor.normalizer.backward`
     的组合逻辑（`ConcatLeftAlign` 只有和 state 一起走 backward 才能正确按
     per-key 统计量还原物理量）。
-  - 数据/模型构建全部走 Hydra，用 `task=<task_name>` 复用训练时的
-    `configs/task/*.yaml`，避免像 EndoWAM 脚本那样手工拼 vla_data 配置。
+  - 数据/模型构建使用训练 run 的 config.yaml 快照，并通过 Hydra instantiate。
+    --task 仅作为结果标签；不会替换训练时的 LoRA、采样与变换配置。
 
 与 EndoWAM 参考脚本的差异：
   - Endo4DWAM 是 video+action 联合 flow-matching 模型，不是离散分类模型，所以
@@ -34,7 +34,7 @@ Endo4DWAM checkpoint，对某个 LeRobot episode 做开环（GT state / 真实�
     conda activate fastwam   （机器上现有的 env，上游 FastWAM 时期建的）
     cd /mnt/data2/ljs/Endo4DWAM/Endo4DWAM-Fast
     python scripts/val_chunk_endowam.py \
-        --ckpt runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60/checkpoints/weights/step_080000.pt \
+        --ckpt runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60_crop_split/checkpoints/weights/step_080000.pt \
         --task endowam_uncond_1cam_1e-4 \
         --dataset_root /mnt/data2/ljs/Endo4DWAM/Endo4DWAM/dataset/endowam_pseudo_z60/esophagus \
         --episode 144 --execution_horizon 8 --max_windows 4000 --num_video_saves 0 --gpu 0
@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import inspect
 import sys
 import time
 import traceback
@@ -57,9 +58,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from hydra import compose, initialize_config_dir
-from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
+from omegaconf import OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -83,11 +83,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "--ckpt", type=str,
-        default="runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60/checkpoints/weights/step_080000.pt",
+        default="runs/endowam_uncond_lora/endo4dwam_uncond_lora_z60_crop_split/checkpoints/weights/step_080000.pt",
         help="model.save_checkpoint() 保存的 .pt 权重文件",
     )
     p.add_argument("--task", type=str, default="endowam_uncond_1cam_1e-4",
-                    help="configs/task/<task>.yaml，用于复现训练时的 model/data 配置")
+                    help="仅保留为结果标签；模型/数据配置从训练快照恢复")
+    p.add_argument("--config", type=str, default=None, help="Training config snapshot; defaults to config.yaml beside the run")
     p.add_argument("--dataset_stats", type=str, default=None,
                     help="dataset_stats.json 路径；缺省从 ckpt 的上级 run 目录自动查找")
     p.add_argument("--dataset_root", type=str,
@@ -152,6 +153,32 @@ def _resolve_dataset_stats_path(ckpt_path: Path, explicit: Optional[str]) -> Pat
     )
 
 
+def load_training_config(ckpt_path: Path, explicit=None):
+    candidates = [Path(explicit)] if explicit else [p / "config.yaml" for p in ckpt_path.resolve().parents[:4]]
+    for candidate in candidates:
+        if candidate.is_file():
+            return OmegaConf.load(candidate)
+    raise FileNotFoundError("Training config.yaml not found; pass --config with the exact training snapshot")
+
+
+def infer_action_window(model, batched, args, action_horizon, memory_state=None):
+    history = int(getattr(model, "num_history_pixel_frames", 1))
+    kwargs = dict(
+        prompt=None,
+        input_image=batched["video"][0, :, :history].permute(1, 0, 2, 3).to(device=model.device, dtype=model.torch_dtype),
+        action_horizon=action_horizon,
+        proprio=batched["proprio"][:, 0, :].to(device=model.device, dtype=model.torch_dtype),
+        context=batched["context"][0], context_mask=batched["context_mask"][0],
+        text_cfg_scale=args.text_cfg_scale, num_inference_steps=args.num_inference_steps,
+        seed=args.seed,
+    )
+    if "num_video_frames" in inspect.signature(model.infer_action).parameters:
+        kwargs["num_video_frames"] = batched["video"].shape[2]
+    if "memory_state" in inspect.signature(model.infer_action).parameters:
+        kwargs["memory_state"] = memory_state
+    return model.infer_action(**kwargs)
+
+
 def denormalize_action_chunk(processor, action_btd: torch.Tensor, proprio_btd: torch.Tensor) -> np.ndarray:
     """物理空间 action，[T, D]。照搬 Wan22Trainer.evaluate() 的 denorm 组合逻辑：
 
@@ -214,7 +241,8 @@ def run_detailed_window(model, batched: dict, processor, args, out_dir: Path, wi
     action = batched["action"][0] if batched.get("action") is not None else None
     proprio_full = batched["proprio"][0] if batched.get("proprio") is not None else None  # [T, d]
     proprio0 = proprio_full[0] if proprio_full is not None else None  # [d]
-    input_image = video0[:, 0].unsqueeze(0)
+    history = int(getattr(model, "num_history_pixel_frames", 1))
+    input_image = video0[:, :history].permute(1, 0, 2, 3)
     _, num_frames, _, _ = video0.shape
 
     infer_kwargs = {
@@ -276,6 +304,8 @@ def run_detailed_window(model, batched: dict, processor, args, out_dir: Path, wi
 
 def main() -> None:
     args = parse_args()
+    if args.execution_horizon <= 0:
+        raise ValueError("execution_horizon must be positive")
 
     ckpt_path = Path(args.ckpt).expanduser().resolve()
     if not ckpt_path.is_file():
@@ -303,11 +333,12 @@ def main() -> None:
 
     misc.register_work_dir(str(out_dir))
 
-    configs_root = str(PROJECT_ROOT / "configs")
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    with initialize_config_dir(version_base="1.3", config_dir=configs_root):
-        cfg = compose(config_name="train", overrides=[f"task={args.task}"])
+    from endo4dwam.utils.config_resolvers import register_default_resolvers
+    register_default_resolvers()
+    cfg = load_training_config(ckpt_path, args.config)
+    # The policy needs no auxiliary decoder at inference.
+    if cfg.model.get("geometry") is not None:
+        cfg.model.geometry.enable = False
 
     model_dtype = _mixed_precision_to_model_dtype(cfg.mixed_precision)
     print(f"[model] building Endo4DWAM (dtype={model_dtype}, device={device}) ...")
@@ -319,9 +350,9 @@ def main() -> None:
     model_keys = set(model.mot.state_dict().keys())
     ckpt_keys = set(payload["mot"].keys())
     missing, unexpected = model_keys - ckpt_keys, ckpt_keys - model_keys
+    unexpected = {key for key in unexpected if not key.startswith("geometry.")}
     if missing or unexpected:
-        print(f"[warn] load_checkpoint key mismatch: missing={len(missing)} unexpected={len(unexpected)} "
-              "(检查 --task 的 LoRA 配置是否与训练时一致)")
+        raise ValueError(f"Policy checkpoint mismatch: missing={sorted(missing)[:8]} unexpected={sorted(unexpected)[:8]}")
     model.load_checkpoint(str(ckpt_path))
     model = model.to(device).eval()
 
@@ -337,6 +368,8 @@ def main() -> None:
         is_training_set=False,
         val_set_proportion=0.0,
         pretrained_norm_stats=str(dataset_stats_path),
+        geometry=None,
+        skip_padding_as_possible=False,
     )
     dataset.lerobot_dataset.processor.eval()
     processor = dataset.lerobot_dataset.processor
@@ -348,11 +381,15 @@ def main() -> None:
     ep_from = int(ep_from_all[args.episode].item())
     ep_to = int(ep_to_all[args.episode].item())
     num_frames = dataset.num_frames
-    action_horizon = num_frames - 1
+    action_horizon = num_frames - 1 - int(getattr(dataset, "history_action_steps", 0))
+    if args.execution_horizon > action_horizon:
+        raise ValueError(f"execution_horizon must be <= action horizon {action_horizon}")
     print(f"[data] episode {args.episode}: frames [{ep_from}, {ep_to}) = {ep_to - ep_from} raw frames, "
           f"window={num_frames} raw frames -> action_horizon={action_horizon}")
 
-    all_starts = list(range(ep_from, ep_to - num_frames + 1, args.execution_horizon))
+    stride = dataset.lerobot_dataset.global_sample_stride
+    window_span = (num_frames - 1) * stride + 1
+    all_starts = list(range(ep_from, ep_to - window_span + 1, args.execution_horizon * stride))
     if not all_starts:
         raise ValueError(
             f"Episode too short for one window: needs >= {num_frames} raw frames, has {ep_to - ep_from}."
@@ -378,28 +415,25 @@ def main() -> None:
     print(f"[run] {len(starts)} windows, execution_horizon={args.execution_horizon}, "
           f"num_inference_steps={args.num_inference_steps}, {len(save_video_at)} detailed(video+loss) windows")
 
+    completed_windows = 0
+    failures = []
+    # One explicit state per episode. The script evaluates exactly one episode,
+    # so initialization here is the episode-boundary reset; every successful
+    # receding-horizon window hands its updated visual state to the next window.
+    memory_state = model.init_memory(1) if hasattr(model, "init_memory") else None
     for w, start_idx in enumerate(starts):
         try:
             raw_sample = dataset[start_idx]
             batched = Wan22Trainer._to_batched_eval_sample(raw_sample)
 
-            first_frame = batched["video"][:, :, 0].to(device=model.device, dtype=model.torch_dtype)
-            proprio0 = batched["proprio"][:, 0, :].to(device=model.device, dtype=model.torch_dtype)
-
             t0 = time.time()
             with torch.no_grad():
-                pred = model.infer_action(
-                    prompt=None,
-                    input_image=first_frame,
-                    action_horizon=action_horizon,
-                    proprio=proprio0,
-                    context=batched["context"][0],
-                    context_mask=batched["context_mask"][0],
-                    text_cfg_scale=args.text_cfg_scale,
-                    num_inference_steps=args.num_inference_steps,
-                    seed=args.seed,
+                pred = infer_action_window(
+                    model, batched, args, action_horizon, memory_state=memory_state
                 )
             dt_ms = (time.time() - t0) * 1000.0
+            if "memory_state" in pred:
+                memory_state = pred["memory_state"]
 
             pred_action_norm = pred["action"].unsqueeze(0)  # [1, T, D]
             gt_action_norm = batched["action"]  # [1, T, D]
@@ -429,14 +463,18 @@ def main() -> None:
                 print(f"  loss_total={metrics['loss_total']:.4f} loss_video={metrics['loss_video']:.4f} "
                       f"loss_action={metrics['loss_action']:.4f} "
                       f"psnr_rollout_vs_gt={metrics['psnr_rollout_vs_gt']:.2f}")
+            completed_windows += 1
         except Exception as e:  # noqa: BLE001
             print(f"window {w} (raw_idx={start_idx}) 出错: {e}")
             traceback.print_exc()
+            failures.append({"window": w, "raw_idx": start_idx, "error": str(e)})
             break
 
     if not stitched_pred:
-        print("没有成功执行任何窗口，退出。")
-        return
+        failure_path = Path(args.json_out) if args.json_out else out_dir / "summary.json"
+        failure_path.parent.mkdir(parents=True, exist_ok=True)
+        failure_path.write_text(json.dumps({"status": "failed", "num_windows": 0, "num_windows_planned": len(starts), "failures": failures}, indent=2))
+        raise RuntimeError("No evaluation window succeeded; see summary.json")
 
     gt_arr = np.array(stitched_gt)
     pred_arr = np.array(stitched_pred)
@@ -468,11 +506,16 @@ def main() -> None:
 
     summary = {
         "ckpt": str(ckpt_path),
-        "task": args.task,
+        "model_target": str(cfg.model._target_),
+        "task_label": args.task,
         "dataset_root": str(dataset_root),
         "episode": args.episode,
         "execution_horizon": args.execution_horizon,
-        "num_windows": len(starts),
+        "persistent_memory": bool(getattr(model, "world_memory", None) is not None),
+        "status": "failed" if failures else "complete",
+        "num_windows": completed_windows,
+        "num_windows_planned": len(starts),
+        "failures": failures,
         "num_windows_available": len(all_starts),
         "per_axis": per_axis,
         "overall_acc": overall,
@@ -486,6 +529,8 @@ def main() -> None:
     with open(json_out, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n已保存 JSON 摘要: {json_out}")
+    if failures:
+        raise RuntimeError(f"Evaluation incomplete: {completed_windows}/{len(starts)} windows")
 
 
 if __name__ == "__main__":

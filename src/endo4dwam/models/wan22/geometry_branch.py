@@ -55,9 +55,17 @@ class _GeoBlock(nn.Module):
             nn.Linear(ffn_mult * geo_dim, geo_dim),
         )
 
-    def forward(self, registers: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        registers: torch.Tensor,
+        history: torch.Tensor,
+        memory: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         q_in = self.norm_q(registers)
-        kv_in = self.norm_kv(torch.cat([registers, history], dim=1))
+        kv_parts = [registers, history]
+        if memory is not None:
+            kv_parts.append(memory)
+        kv_in = self.norm_kv(torch.cat(kv_parts, dim=1))
 
         def split(x):
             b, s, _ = x.shape
@@ -76,7 +84,8 @@ class RegisterStack(nn.Module):
     """One modality's register bank. Depth and motion each get their own."""
 
     def __init__(self, *, num_time: int, num_spatial: int, video_dim: int,
-                 geo_dim: int, num_heads: int, num_blocks: int):
+                 geo_dim: int, num_heads: int, num_blocks: int,
+                 memory_dim: int | None = None):
         super().__init__()
         self.num_time = int(num_time)
         self.num_spatial = int(num_spatial)
@@ -86,9 +95,17 @@ class RegisterStack(nn.Module):
         self.grid = nn.Parameter(torch.randn(1, num_spatial, geo_dim) * geo_dim ** -0.5)
         self.time_embed = nn.Parameter(torch.randn(1, num_time, 1, geo_dim) * geo_dim ** -0.5)
         self.kv_down = nn.ModuleList([nn.Linear(video_dim, geo_dim) for _ in range(num_blocks)])
+        self.memory_down = nn.ModuleList([
+            nn.Identity() if memory_dim in (None, geo_dim) else nn.Linear(memory_dim, geo_dim)
+            for _ in range(num_blocks)
+        ])
         self.blocks = nn.ModuleList([_GeoBlock(geo_dim, num_heads) for _ in range(num_blocks)])
 
-    def forward(self, captures: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(
+        self,
+        captures: List[torch.Tensor],
+        memory: torch.Tensor | None = None,
+    ) -> List[torch.Tensor]:
         """`captures[i]` is the history slice of the video hidden state at capture
         layer i, shaped [B, N_hist, video_dim]. Returns one pyramid level per
         block, each [B, num_time, num_spatial, geo_dim].
@@ -100,8 +117,11 @@ class RegisterStack(nn.Module):
         regs = regs.expand(batch, -1, -1).to(dtype=captures[0].dtype)
 
         levels = []
-        for block, down, hist in zip(self.blocks, self.kv_down, captures):
-            regs = block(regs, down(hist))
+        for block, down, memory_down, hist in zip(
+            self.blocks, self.kv_down, self.memory_down, captures
+        ):
+            memory_level = None if memory is None else memory_down(memory)
+            regs = block(regs, down(hist), memory_level)
             levels.append(regs.view(batch, self.num_time, self.num_spatial, self.geo_dim))
         return levels
 
@@ -124,21 +144,27 @@ class GeometryBranch(nn.Module):
 
 
 def build_geometry_branch(config: dict, *, video_dim: int, num_spatial: int, num_time: int,
+                          num_history: int = 1,
+                          memory_dim: int | None = None,
                           device=None, dtype=None) -> GeometryBranch:
     capture_layers = config.get("capture_layers", (12, 14, 16, 18))
     geo_dim = int(config.get("geo_dim", 1024))
     num_heads = int(config.get("num_heads", 8))
 
-    def stack(enabled: bool) -> RegisterStack | None:
+    def stack(enabled: bool, steps: int) -> RegisterStack | None:
         if not enabled:
             return None
-        return RegisterStack(num_time=num_time, num_spatial=num_spatial, video_dim=video_dim,
-                             geo_dim=geo_dim, num_heads=num_heads, num_blocks=len(capture_layers))
+        return RegisterStack(num_time=steps, num_spatial=num_spatial, video_dim=video_dim,
+                             geo_dim=geo_dim, num_heads=num_heads, num_blocks=len(capture_layers),
+                             memory_dim=memory_dim)
+
+    motion_cfg = config.get("motion", {})
+    motion_steps = num_time + (int(num_history) - 1 if motion_cfg.get("include_observed", False) else 0)
 
     branch = GeometryBranch(
         capture_layers=capture_layers,
-        depth=stack(bool(config.get("depth", {}).get("enable", True))),
-        motion=stack(bool(config.get("motion", {}).get("enable", True))),
+        depth=stack(bool(config.get("depth", {}).get("enable", True)), num_time),
+        motion=stack(bool(motion_cfg.get("enable", True)), motion_steps),
     )
     if device is not None or dtype is not None:
         branch = branch.to(device=device, dtype=dtype)

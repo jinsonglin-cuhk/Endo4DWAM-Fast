@@ -190,6 +190,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 lerobot_sample = self._split_lerobot_sample(lerobot_sample)
                 break
             except Exception as err:
+                if not self.is_training_set:
+                    raise
                 attempt += 1
                 last_exception = err
                 logger.warning(

@@ -214,36 +214,6 @@ def main(cfg: DictConfig):
     redirect_common_files = bool(model_cfg.get("redirect_common_files", True))
     enc_id = _model_id_to_enc_id(model_id)
 
-    logger.info(
-        "Preparing text encoder with model_id=%s tokenizer_model_id=%s device=%s dtype=%s context_len=%d overwrite=%s",
-        model_id,
-        tokenizer_model_id,
-        device,
-        torch_dtype,
-        context_len,
-        overwrite,
-    )
-
-    _, text_config, _, tokenizer_config = _resolve_configs(
-        model_id=model_id,
-        tokenizer_model_id=tokenizer_model_id,
-        redirect_common_files=redirect_common_files,
-    )
-    text_config.download_if_necessary()
-    tokenizer_config.download_if_necessary()
-
-    text_encoder = _load_registered_model(
-        text_config.path,
-        "wan_video_text_encoder",
-        torch_dtype=torch_dtype,
-        device=device,
-    ).eval()
-    tokenizer = HuggingfaceTokenizer(
-        name=tokenizer_config.path,
-        seq_len=context_len,
-        clean="whitespace",
-    )
-
     stats = {
         str(cache_dir): {"new": 0, "overwrite": 0, "skip": 0}
         for cache_dir in cache_dirs
@@ -251,6 +221,7 @@ def main(cfg: DictConfig):
 
     prompts = prompts[rank::world_size] if is_distributed else prompts
 
+    to_encode_global = len(prompts)
     if not overwrite:
         fully_cached_local = 0
         prompts_to_encode: list[str] = []
@@ -287,6 +258,51 @@ def main(cfg: DictConfig):
                 fully_cached_global,
                 to_encode_global,
             )
+
+    # Check the cache before constructing the 5B-class UMT5 encoder. This makes
+    # `+overwrite=false` a cheap readiness check instead of consuming ~30 GB RAM
+    # and GPU memory even when every prompt is already cached.
+    if to_encode_global == 0:
+        if (not is_distributed) or rank == 0:
+            logger.info("All prompt embeddings are already cached; text encoder was not loaded.")
+            for cache_dir in cache_dirs:
+                key = str(cache_dir)
+                logger.info(
+                    "Cache dir: %s | new=%d overwrite=%d skip=%d",
+                    key,
+                    stats[key]["new"],
+                    stats[key]["overwrite"],
+                    stats[key]["skip"],
+                )
+        return
+
+    logger.info(
+        "Preparing text encoder with model_id=%s tokenizer_model_id=%s device=%s dtype=%s context_len=%d overwrite=%s",
+        model_id,
+        tokenizer_model_id,
+        device,
+        torch_dtype,
+        context_len,
+        overwrite,
+    )
+    _, text_config, _, tokenizer_config = _resolve_configs(
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        redirect_common_files=redirect_common_files,
+    )
+    text_config.download_if_necessary()
+    tokenizer_config.download_if_necessary()
+    text_encoder = _load_registered_model(
+        text_config.path,
+        "wan_video_text_encoder",
+        torch_dtype=torch_dtype,
+        device=device,
+    ).eval()
+    tokenizer = HuggingfaceTokenizer(
+        name=tokenizer_config.path,
+        seq_len=context_len,
+        clean="whitespace",
+    )
 
     logger.info("Writing caches to %d directories.", len(cache_dirs))
     prompts_encoded_local = len(prompts)

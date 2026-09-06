@@ -6,6 +6,12 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
+# `mixed` is the original joint video/action training implementation. `cached`
+# is an execution-matched control for persistent-memory experiments: video is
+# prefetched once, then action reads its K/V cache, exactly as at deployment.
+training_attention_path: mixed
+action_to_video_grad_scale: 1.0  # action-query -> video-K/V backward scale; forward is unchanged
+action_to_memory_grad_scale: 1.0 # action-query -> memory-K/V backward scale
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
@@ -31,8 +37,8 @@ video_dit_config:
   # Leading latent frames kept clean as history. K=1 reproduces the original
   # first-frame-only behaviour bit-for-bit. Measured pixel->latent grouping (P0):
   # lat0 <- pix0 alone, lat_j (j>=1) <- pix[4j-3..4j], so K=2 == 5 history pixel
-  # frames and leaves 3 future latent steps out of 5.
-  # NOTE: inference still conditions on one frame, so K>1 raises there for now.
+  # frames. The standalone 17-frame default would leave 3 future latents;
+  # history=k2 uses 21 frames so the fair ablation retains 4 future latents.
   num_history_latent_frames: 1
   action_conditioned: false
   action_dim: ${data.train.processor.action_output_dim}
@@ -60,30 +66,54 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
+# Persistent visual-only state used by the base action policy. It is updated from
+# clean history tokens at capture_layer, never from action or noisy future video.
+# Rollout state is passed explicitly and reset at every episode boundary.
+memory:
+  enable: false
+  action_read: true
+  geometry_read: true
+  num_tokens: 64
+  dim: 1024
+  capture_layer: 18
+  num_heads: 8
+  num_blocks: 2
+  ffn_mult: 4
+
 # Training-only geometry / motion readout (WAM4D-style spatial registers).
 # Removed entirely at inference; `enable: false` is bit-identical to no branch.
-# register_grid must equal the DiT token grid: video_size / 16 (VAE) / 2 (patch).
+# register_grid is the auxiliary DPT readout grid; grid * head.patch_size must
+# equal data.video_size. It is independent of the denser DiT video-token grid.
 # num_supervised_steps is the number of FUTURE latent steps = T_lat - K.
 geometry:
   enable: false
+  detach_history: false               # true is the no-distillation control ablation
   capture_layers: [12, 14, 16, 18]   # WAM4D Table 7: middle layers won
-  geo_dim: 1024                      # == DA3 DPT dim_in, so no adapter is needed
+  geo_dim: 1024                      # EdGE readout adapts this to frame/global dim 2048
   num_heads: 8                       # 1024 / 8 = 128; the video expert's 24 does not divide 1024
   register_grid: [8, 10]             # 256x320 -> 8x10 cells of 32x32 px
   num_supervised_steps: 4            # T_lat 5 - K 1
   depth:
     enable: true
+    gradient_weight: 0.0
   motion:
     enable: true
+    include_observed: true
+    loss_type: charbonnier
+    charbonnier_epsilon: 1.0e-3
+    charbonnier_alpha: 0.5
   head:
-    model_id: depth-anything/DA3MONO-LARGE   # same source as the depth teacher
+    type: edge                               # use `da3` for the decoder ablation
+    source_path: ${oc.env:EDGE_SRC,/mnt/data2/ljs/Endo4DWAM/EdGE-review}
+    weights_path: ${oc.env:EDGE_WEIGHTS,/mnt/data2/ljs/Endo4DWAM/EdGE-review/weights/model.safetensors}
+    model_id: depth-anything/DA3MONO-LARGE   # used only when type=da3
     patch_size: 32                           # 8x10 tokens -> 256x320
-    freeze: false                            # WAM4D Table 8: trainable pretrained won
+    freeze: false                            # train adapters + pretrained decoder
 
 loss:
   lambda_action: 1.0
   # Geometry readout weights. Deliberately below WAM4D's lambda_depth=1: our depth is
-  # a domain-shifted DA3 pseudo-label, our flow a RAFT pseudo-label and our action a
+  # an EdGE pseudo-label, our flow a RAFT pseudo-label and our action a
   # pseudo-action, so the raw loss scales are not the paper's. Start small and watch
   # the gradient-norm ratio on the shared history features, not the loss values.
   lambda_depth: 0.0

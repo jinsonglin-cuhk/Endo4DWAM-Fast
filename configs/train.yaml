@@ -5,6 +5,11 @@ defaults:
   - data: null
   - model: null
   - task: null
+  # Orthogonal experiment axes. A task may pin all three (the immutable
+  # FastWAM baseline does); CLI selections are applied after the task.
+  - history: null
+  - auxiliary: null
+  - persistent_memory: null
 
 
 output_dir: ./runs/train/${now:%Y-%m-%d}_${now:%H-%M-%S}
@@ -22,6 +27,9 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10
+# When false, validation calls model.infer_action() and never denoises/decodes a
+# future video. The training loss still learns both future video and action.
+eval_generate_video: true
 
 # training
 gradient_accumulation_steps: 1
@@ -31,6 +39,21 @@ max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
 save_total_limit: null   # set to positive int to keep only the last N checkpoints (weights + state dirs)
+
+# Optional progressive S0->S2 unfreezing. Null means that module stays frozen.
+# Dormant action/geometry/LoRA parameters are registered with AdamW up front so
+# changing requires_grad at the threshold is a real optimizer change.
+curriculum:
+  enable: false
+  geometry_unfreeze_step: 0
+  head_unfreeze_step: 0
+  memory_unfreeze_step: 0
+  video_unfreeze_step: 0
+  action_unfreeze_step: 0
+  action_to_video_grad_scale_before: 1.0
+  action_to_video_grad_scale_after: 1.0
+  action_to_memory_grad_scale_before: 1.0
+  action_to_memory_grad_scale_after: 1.0
 
 # wandb
 wandb:

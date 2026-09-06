@@ -180,6 +180,7 @@ class WorldActionRobotWinPolicy:
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
+        self.memory_state = self.model.init_memory(1) if hasattr(self.model, "init_memory") else None
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -254,9 +255,13 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        if "memory_state" in inspect.signature(self.model.infer_action).parameters:
+            infer_kwargs["memory_state"] = self.memory_state
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
+        if "memory_state" in pred:
+            self.memory_state = pred["memory_state"]
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
@@ -306,6 +311,7 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        self.memory_state = self.model.init_memory(1) if hasattr(self.model, "init_memory") else None
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()

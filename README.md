@@ -1,5 +1,8 @@
 # Endo4DWAM-Fast
 
+
+> Pipeline updated 2026-09-05: aspect-preserving crop, held-out episodes, strict geometry labels and checkpoint-config evaluation. See [training guide](scripts/TRAINING.md) for current commands and limitations.
+
 A **video + action world model baseline for endoscopy**, built on top of
 [FastWAM](https://github.com/yuantianyuan01/FastWAM) (Wan2.2-TI2V-5B video DiT + ActionDiT,
 trained with joint flow matching) and adapted to the EndoWAM endoscope dataset.
@@ -64,7 +67,8 @@ Endo4DWAM-Fast/
 │   │   ├── endo4dwam_joint.yaml
 │   │   └── endo4dwam_idm.yaml
 │   └── task/
-│       ├── endowam_uncond_1cam_1e-4.yaml # Base task config
+│       ├── endowam_fastwam_baseline_1cam_1e-4.yaml # Pinned original FastWAM control
+│       ├── endowam_uncond_1cam_1e-4.yaml # Base + LoRA task config
 │       └── endowam_joint_1cam_1e-4.yaml  # Joint task config
 ├── scripts/
 │   ├── TRAINING.md                       # Detailed training guide (Chinese)
@@ -166,17 +170,25 @@ The text encoder is frozen and never loaded onto the GPU during training, so pro
 embeddings must be cached to disk first:
 
 ```bash
-python scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4
+python scripts/precompute_text_embeds.py task=endowam_fastwam_baseline_1cam_1e-4 +overwrite=false
 ```
 
 The cache lands in `./data/text_embeds_cache/endowam/` and is **shared by the uncond and
 joint variants** — running it once is enough. For multi-GPU:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 scripts/precompute_text_embeds.py task=endowam_uncond_1cam_1e-4
+torchrun --standalone --nproc_per_node=2 scripts/precompute_text_embeds.py task=endowam_fastwam_baseline_1cam_1e-4 +overwrite=false
 ```
 
 ## Training
+
+Pinned original FastWAM control (joint video/action training, action-only validation and deployment):
+
+```bash
+bash scripts/train_zero1.sh 2 task=endowam_fastwam_baseline_1cam_1e-4
+```
+
+See [`scripts/TRAINING.md`](scripts/TRAINING.md) for orthogonal history, geometry and persistent-memory ablations.
 
 Dedicated launchers (GPU ids, LoRA settings and hyperparameters are exposed as variables
 at the top of each script):
@@ -240,7 +252,7 @@ and `state/` directories are deleted automatically.
 python scripts/val_chunk_endowam.py \
   --ckpt runs/endowam_uncond_lora/<run_id>/checkpoints/weights/step_080000.pt \
   --task endowam_uncond_1cam_1e-4 \
-  --dataset_root /path/to/endowam_pseudo_z60/esophagus/rot045 \
+  --dataset_root /path/to/endowam_pseudo_z60/esophagus \
   --episode 144 --execution_horizon 8 --max_windows 4000 \
   --num_video_saves 0 --gpu 0
 ```

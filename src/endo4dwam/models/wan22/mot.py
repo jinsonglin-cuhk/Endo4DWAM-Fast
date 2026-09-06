@@ -11,6 +11,17 @@ from endo4dwam.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def scale_gradient(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Identity in the forward pass, ``scale`` times the backward gradient."""
+    scale = float(scale)
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError(f"gradient scale must be in [0,1], got {scale}")
+    if scale == 1.0:
+        return x
+    detached = x.detach()
+    return detached + scale * (x - detached)
+
+
 class MoT(nn.Module):
     def __init__(
         self,
@@ -261,7 +272,10 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
-    ) -> list[dict[str, torch.Tensor]]:
+        capture_layers: Optional[Sequence[int]] = None,
+        capture_out: Optional[Dict[int, torch.Tensor]] = None,
+        return_final_tokens: bool = False,
+    ):
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
         Args:
@@ -294,6 +308,10 @@ class MoT(nn.Module):
                 "`video_attention_mask` seq length mismatch: "
                 f"mask={video_attention_mask.shape[0]} vs tokens={video_tokens.shape[1]}"
             )
+
+        capture_set = frozenset(int(i) for i in capture_layers) if capture_layers else frozenset()
+        if capture_set and capture_out is None:
+            raise ValueError("`capture_out` dict is required when `capture_layers` is set.")
 
         expert = self.mixtures["video"]
         x = video_tokens
@@ -338,6 +356,10 @@ class MoT(nn.Module):
                 context_payload=video_context_payload,
             )
             kv_cache.append({"k": k, "v": v})
+            if layer_idx in capture_set:
+                capture_out[layer_idx] = x
+        if return_final_tokens:
+            return kv_cache, x
         return kv_cache
 
     def forward_action_with_video_cache(
@@ -349,6 +371,9 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        memory_state: Optional[torch.Tensor] = None,
+        action_to_video_grad_scale: float = 1.0,
+        action_to_memory_grad_scale: float = 1.0,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -387,6 +412,28 @@ class MoT(nn.Module):
         # Use the action query rows from the joint [video+action] mask.
         action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
 
+        memory_video_tokens = None
+        if memory_state is not None:
+            memory_module = getattr(self, "world_memory", None)
+            if memory_module is None:
+                raise ValueError("`memory_state` was supplied but MoT has no `world_memory` module")
+            memory_video_tokens = memory_module.as_video_tokens(memory_state)
+            if memory_video_tokens.shape[0] != action_tokens.shape[0]:
+                raise ValueError("memory/action batch size mismatch")
+            memory_mask = torch.ones(
+                (action_seq_len, memory_video_tokens.shape[1]),
+                dtype=torch.bool,
+                device=attention_mask.device,
+            )
+            action_attention_mask = torch.cat(
+                [
+                    action_attention_mask[:, :video_seq_len],
+                    memory_mask,
+                    action_attention_mask[:, video_seq_len:],
+                ],
+                dim=1,
+            )
+
         expert = self.mixtures["action"]
         x = action_tokens
         for layer_idx in range(self.num_layers):
@@ -415,16 +462,32 @@ class MoT(nn.Module):
                     f"`video_kv_cache[{layer_idx}]` must contain `k` and `v`."
                 )
 
-            k_video = layer_cache["k"]
-            v_video = layer_cache["v"]
+            k_video = scale_gradient(layer_cache["k"], action_to_video_grad_scale)
+            v_video = scale_gradient(layer_cache["v"], action_to_video_grad_scale)
             if k_video.shape[1] != video_seq_len or v_video.shape[1] != video_seq_len:
                 raise ValueError(
                     f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
                 )
 
-            # Mixed attention: action queries attend to cached video K/V plus current action K/V.
-            k_cat = torch.cat([k_video, k_action], dim=1)
-            v_cat = torch.cat([v_video, v_action], dim=1)
+            k_parts = [k_video]
+            v_parts = [v_video]
+            if memory_video_tokens is not None:
+                # Memory is positionless and therefore intentionally receives no
+                # video RoPE. Layer-specific pretrained video K/V projections
+                # make it compatible with the action expert's attention space.
+                video_block = self.mixtures["video"].blocks[layer_idx]
+                k_memory = video_block.self_attn.norm_k(
+                    video_block.self_attn.k(memory_video_tokens)
+                )
+                v_memory = video_block.self_attn.v(memory_video_tokens)
+                k_parts.append(scale_gradient(k_memory, action_to_memory_grad_scale))
+                v_parts.append(scale_gradient(v_memory, action_to_memory_grad_scale))
+            # Mixed attention: action queries attend to history-video K/V,
+            # optional persistent-memory K/V, then current action K/V.
+            k_parts.append(k_action)
+            v_parts.append(v_action)
+            k_cat = torch.cat(k_parts, dim=1)
+            v_cat = torch.cat(v_parts, dim=1)
             mixed = self._mixed_attention(
                 q_cat=q_action,
                 k_cat=k_cat,
@@ -453,6 +516,7 @@ class MoT(nn.Module):
         t_mod_all: Dict[str, torch.Tensor],
         capture_layers: Optional[Sequence[int]] = None,
         capture_out: Optional[Dict[int, torch.Tensor]] = None,
+        action_to_video_grad_scale: float = 1.0,
     ):
         """`capture_layers` records the video expert's hidden state after those layer
         indices into the caller-owned `capture_out` dict (used by the training-only
@@ -543,7 +607,34 @@ class MoT(nn.Module):
                     f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
                 )
 
-            mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
+            gamma = float(action_to_video_grad_scale)
+            if gamma == 1.0:
+                mixed = self._mixed_attention(
+                    q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask
+                )
+            else:
+                # Preserve video/video and geometry gradients exactly while only
+                # throttling the action loss path into video K/V features.  The
+                # forward values are unchanged.  This relies on the model's expert
+                # order and mask invariant: video is the prefix, action the suffix.
+                if self.expert_order != ["video", "action"]:
+                    raise ValueError("gradient-gated MoT requires expert order [video, action]")
+                video_len, action_len = seq_lens
+                video_mixed = self._mixed_attention(
+                    q_cat=q_chunks[0],
+                    k_cat=k_chunks[0],
+                    v_cat=v_chunks[0],
+                    attention_mask=attention_mask[:video_len, :video_len],
+                )
+                gated_k_video = scale_gradient(k_chunks[0], gamma)
+                gated_v_video = scale_gradient(v_chunks[0], gamma)
+                action_mixed = self._mixed_attention(
+                    q_cat=q_chunks[1],
+                    k_cat=torch.cat([gated_k_video, k_chunks[1]], dim=1),
+                    v_cat=torch.cat([gated_v_video, v_chunks[1]], dim=1),
+                    attention_mask=attention_mask[video_len:video_len + action_len],
+                )
+                mixed = torch.cat([video_mixed, action_mixed], dim=1)
 
             start = 0
             for name, seq_len in zip(self.expert_order, seq_lens):

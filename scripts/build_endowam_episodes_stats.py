@@ -84,8 +84,7 @@ def process_rot_dir(rot_dir: Path, overwrite: bool) -> int:
     info = json.loads(info_path.read_text())
     parquet_paths = sorted((rot_dir / "data").rglob("episode_*.parquet"))
     if not parquet_paths:
-        print(f"  [WARN] no parquet under {rot_dir/'data'}")
-        return 0
+        raise FileNotFoundError(f"No parquet under {rot_dir / 'data'}")
 
     lines = []
     for pp in parquet_paths:
@@ -100,9 +99,13 @@ def process_rot_dir(rot_dir: Path, overwrite: bool) -> int:
         lines.append({"episode_index": ep_idx, "stats": stats})
 
     lines.sort(key=lambda x: x["episode_index"])
-    with open(out_path, "w") as f:
+    if len(lines) != int(info["total_episodes"]):
+        raise ValueError(f"Incomplete parquet set under {rot_dir}: {len(lines)} vs {info['total_episodes']}")
+    temporary = out_path.with_suffix(".jsonl.tmp")
+    with open(temporary, "w") as f:
         for ln in lines:
             f.write(json.dumps(ln) + "\n")
+    temporary.replace(out_path)
     print(f"  [OK] {out_path.relative_to(rot_dir.parents[1])}  ({len(lines)} episodes)")
     return 1
 
@@ -127,8 +130,7 @@ def main():
                         if d.is_dir() and not d.name.startswith("_")
                         and (not proc_filter or d.name in proc_filter))
     if not procedures:
-        print(f"[ERR] no procedure dirs under {data_root}")
-        return
+        raise RuntimeError(f"No procedure dirs under {data_root}")
 
     total = 0
     n_roots = 0
@@ -153,11 +155,10 @@ def main():
         print(f"[{proc.name}] {len(rot_dirs)} angle dirs")
         for rot in rot_dirs:
             total += process_rot_dir(rot, args.overwrite)
-            n_roots += 1
+            n_roots += int((rot / "meta/info.json").is_file())
 
     if n_roots == 0:
-        print(f"\n[ERR] no LeRobot roots found under {data_root}")
-        return
+        raise RuntimeError(f"No LeRobot roots found under {data_root}")
     print(f"\nDone. wrote episodes_stats.jsonl for {total}/{n_roots} roots under {data_root}")
 
 

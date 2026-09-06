@@ -1,0 +1,10 @@
+# @package _global_
+# Original one-latent-frame history: 1 observed RGB frame + 32 future actions.
+model:
+  video_dit_config:
+    num_history_latent_frames: 1
+  geometry:
+    num_supervised_steps: 4
+data:
+  train:
+    num_frames: 33
